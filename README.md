@@ -18,7 +18,7 @@
 - **Rotating proxies** — SOCKS5/HTTP proxy pool with round-robin (`ip:port:user:pass`)
 - **Batch creation** — `python main.py signup -n 10` and walk away
 - **Append-safe** — every account appended to `accounts.jsonl`, never overwrites
-- **Temp mail** — powered by [tempik](https://github.com/hirotomasato/tempik), self-hostable
+- **Temp mail** — powered by [tempik](https://github.com/hirotomasato/tempik), deployable on Cloudflare Workers
 
 ## Quick Start
 
@@ -113,9 +113,9 @@ Each successful account is appended to `data/accounts.jsonl`:
 
 ## Temp Mail
 
-This project uses [**tempik**](https://github.com/hirotomasato/tempik) — a lightweight disposable email API written in Node.js. You can use the public instance or [self-host your own](https://github.com/hirotomasato/tempik).
+This project uses [**tempik**](https://github.com/hirotomasato/tempik) � deployed on your Cloudflare Workers — a lightweight disposable email API written in Node.js. Deploy on your own Cloudflare Workers � see the [tempik repo](https://github.com/hirotomasato/tempik) for setup instructions.
 
-Default instance: `https://tempik.example.com/api`
+Set your Cloudflare Workers URL in `config.toml` ? `tempmail_base`.
 
 ## Claim / Trial
 

@@ -1,12 +1,12 @@
 # Qoder Creator - Configuration Example
 # Copy this file to config.toml and fill in your values.
-# config.toml is gitignored â€” never commit real credentials.
+# config.toml is gitignored — never commit real credentials.
 
 [api]
-# Tempik â€” disposable email API
-# Self-host: https://github.com/hirotomasato/tempik
-# Or use the public instance below
-tempmail_base = "https://tempik.example.com/api"
+# Tempik — disposable email API (Cloudflare Workers)
+# Deploy: https://github.com/hirotomasato/tempik
+# Set ke URL Cloudflare Workers Anda, contoh:
+tempmail_base = "https://tempik.yourdomain.com/api"
 
 # Qoder endpoints
 qoder_base = "https://qoder.com"
