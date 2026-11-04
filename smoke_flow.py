@@ -113,6 +113,13 @@ TempikClient.wait_for_messages = _wait_stub
 
 
 async def main():
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if stream is not None and hasattr(stream, "reconfigure"):
+                try:
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+                except (OSError, ValueError):
+                    pass
     from rich.console import Console
     mgr = signup_mod.SignupManager(proxy_pool=None, headless=True, console=Console())
     result = await mgr.create_account(1)

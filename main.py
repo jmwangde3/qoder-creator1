@@ -13,9 +13,16 @@ import asyncio
 import os
 import sys
 
-# Force UTF-8 on Windows to avoid UnicodeEncodeError with Rich
+# Force UTF-8 on Windows to avoid UnicodeEncodeError with Rich.
+# PYTHONIOENCODING only affects new processes, so reconfigure live streams too.
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
 
 from rich import box
 from rich.console import Console
