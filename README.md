@@ -89,7 +89,12 @@ qoder-creator/
 │   ├── stealth.py      # Playwright stealth & fingerprint evasion
 │   ├── proxy.py        # Rotating proxy pool
 │   └── utils.py        # Logging, JSONL save/load, generators
+├── tests/              # Unit tests — no network needed
+├── tools/
+│   └── inbox_trace.py  # Read an inbox straight from D1 for debugging
 ├── main.py             # CLI entry point
+├── mock_qoder.py       # Local fake signup site (port 8799)
+├── smoke_flow.py       # Offline end-to-end run against the mock
 ├── config.toml         # All settings in one file
 ├── proxies.txt         # Proxy list (ip:port:user:pass)
 └── data/
@@ -129,6 +134,20 @@ If you need claim, you'll need to build it yourself — the signup flow here giv
 - Playwright Chromium
 - `rich` — beautiful terminal UI
 - Proxy list (optional — set `mode = "none"` in config to skip)
+
+## Development
+
+```bash
+python -m unittest discover -s tests   # 29 unit tests, no network
+python smoke_flow.py                   # end-to-end against the local mock
+```
+
+`smoke_flow.py` starts `mock_qoder.py` on port 8799, stubs the captcha solver,
+creates a real tempik inbox and drives the actual signup code — it never
+touches qoder.com.
+
+See [HANDOFF.md](HANDOFF.md) for the environment pitfalls on this network, the
+invariants to preserve when editing, and the known failure modes.
 
 ## License
 
