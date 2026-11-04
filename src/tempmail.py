@@ -13,6 +13,7 @@ import json
 import random
 import re
 import time
+import urllib.error
 import urllib.request
 from typing import List, Optional, Dict, Any
 
@@ -30,6 +31,11 @@ _BROWSER_UA = (
 # used to poison the domain list for the whole run — retry a couple of times.
 _FETCH_RETRIES = 3
 
+# Any single request can hit a TLS handshake timeout on a flaky uplink; one
+# lost handshake should not throw away an otherwise good account.
+_HTTP_RETRIES = 3
+_RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
+
 
 class TempikClient:
     """Tempik disposable email API client."""
@@ -39,6 +45,54 @@ class TempikClient:
         self.session_id: Optional[str] = None
         self._email: Optional[str] = None
         self._domains: List[str] = []
+
+    # ==================== TRANSPORT ====================
+    def _request(
+        self,
+        path: str,
+        method: str = "GET",
+        body: Optional[Dict[str, Any]] = None,
+        with_session: bool = True,
+        retries: int = _HTTP_RETRIES,
+    ) -> Any:
+        """Call the tempik API, retrying transport-level failures.
+
+        4xx answers are re-raised immediately (except 429): they mean the
+        request itself is wrong, so retrying cannot change the outcome.
+        """
+        url = f"{self.base_url}{path}"
+        data = None if body is None else json.dumps(body).encode()
+        last: Optional[Exception] = None
+
+        for attempt in range(1, retries + 1):
+            req = urllib.request.Request(url, data=data, method=method)
+            req.add_header("Accept", "application/json")
+            req.add_header("User-Agent", _BROWSER_UA)
+            req.add_header("Accept-Language", "en-US,en;q=0.9")
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
+            if with_session and self.session_id:
+                req.add_header("x-session-id", self.session_id)
+
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                if 400 <= e.code < 500 and e.code != 429:
+                    raise
+                last = e
+            except Exception as e:
+                last = e
+
+            if attempt < retries:
+                write_log(
+                    f"Tempik {method} {path} attempt {attempt}/{retries} "
+                    f"failed: {last}",
+                    "WARNING",
+                )
+                time.sleep(_RETRY_BACKOFF * attempt)
+
+        raise last  # type: ignore[misc]
 
     # ==================== CONFIG ====================
     def _fetch_domains(self) -> List[str]:
@@ -52,40 +106,25 @@ class TempikClient:
         if self._domains:
             return self._domains
 
-        url = f"{self.base_url}/config"
-        last: Optional[Exception] = None
-
-        for attempt in range(1, _FETCH_RETRIES + 1):
-            try:
-                req = urllib.request.Request(url, method="GET")
-                req.add_header("Accept", "application/json")
-                req.add_header("User-Agent", _BROWSER_UA)
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode())
-
-                domains = data.get("mailDomains") or []
-                if not domains and data.get("mailDomain"):
-                    domains = [data["mailDomain"]]
-                if domains:
-                    self._domains = domains
-                    write_log(f"Tempik domains: {self._domains}", "INFO")
-                    return self._domains
-
-                last = ValueError("response has no mailDomains/mailDomain")
-            except Exception as e:
-                last = e
-
+        try:
+            data = self._request(
+                "/config",
+                with_session=False,
+                retries=_FETCH_RETRIES,
+            )
+            domains = data.get("mailDomains") or []
+            if not domains and data.get("mailDomain"):
+                domains = [data["mailDomain"]]
+            if domains:
+                self._domains = domains
+                write_log(f"Tempik domains: {self._domains}", "INFO")
+                return self._domains
+            write_log("Tempik /config had no mailDomains", "WARNING")
+        except Exception as e:
             write_log(
-                f"Tempik domain fetch {attempt}/{_FETCH_RETRIES} failed: {last}",
+                f"Tempik domain fetch gave up ({e}); using server default domain",
                 "WARNING",
             )
-            if attempt < _FETCH_RETRIES:
-                time.sleep(1.5 * attempt)
-
-        write_log(
-            f"Tempik domain fetch gave up ({last}); using server default domain",
-            "WARNING",
-        )
         return []
 
     # ==================== SESSION ====================
@@ -94,16 +133,10 @@ class TempikClient:
         if self.session_id:
             return self.session_id
 
-        url = f"{self.base_url}/session"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", _BROWSER_UA)
-        req.add_header("Accept-Language", "en-US,en;q=0.9")
-
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-
-        self.session_id = data.get("sessionId") or data.get("id") or data.get("session_id")
+        data = self._request("/session", with_session=False)
+        self.session_id = (
+            data.get("sessionId") or data.get("id") or data.get("session_id")
+        )
         write_log(f"Tempik session: {self.session_id[:8]}...", "INFO")
         return self.session_id
 
@@ -120,25 +153,19 @@ class TempikClient:
             domains = self._fetch_domains()
             domain = random.choice(domains) if domains else None
 
-        url = f"{self.base_url}/inboxes"
         body_data: Dict[str, Any] = {}
         if domain:
             body_data["domain"] = domain
         if local_part:
             body_data["localPart"] = local_part
-        body = json.dumps(body_data).encode()
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Accept", "application/json")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("x-session-id", self.session_id)
-        req.add_header("User-Agent", _BROWSER_UA)
-        req.add_header("Accept-Language", "en-US,en;q=0.9")
 
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+        data = self._request("/inboxes", method="POST", body=body_data)
 
         self._email = data.get("address")
-        write_log(f"Tempik inbox: {self._email} (domain={domain or 'server-default'})", "INFO")
+        write_log(
+            f"Tempik inbox: {self._email} (domain={domain or 'server-default'})",
+            "INFO",
+        )
         return self._email
 
     # ==================== MESSAGES ====================
@@ -148,16 +175,7 @@ class TempikClient:
         if not addr:
             raise ValueError("No email address provided")
 
-        url = f"{self.base_url}/inboxes/{addr}/messages"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", _BROWSER_UA)
-        if self.session_id:
-            req.add_header("x-session-id", self.session_id)
-
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-
+        data = self._request(f"/inboxes/{addr}/messages")
         return data if isinstance(data, list) else []
 
     async def wait_for_messages(
