@@ -20,6 +20,13 @@ from .stealth import create_stealth_context, launch_stealth_browser
 from .captcha import solve_slider_local
 from .pat import PATManager
 
+# Qoder's verification screen has no "resend" control. The only way to get a
+# fresh code is to hit the back button, re-submit the password and pass the
+# slider again. The very first send is sometimes lost entirely, so give the
+# mail a limited window before falling back to that.
+OTP_WAIT_SECONDS = 45
+OTP_ROUNDS = 3  # initial send + 2 re-sends
+
 
 class SignupManager:
     """Handle Qoder signup + PAT creation."""
@@ -132,21 +139,32 @@ class SignupManager:
                 c.print("  :white_check_mark: [green]Captcha solved![/]")
                 await page.wait_for_timeout(2000)
 
-                # Step 7: Wait for OTP
-                c.print("  :inbox_tray: Waiting for OTP email...")
-                messages = await tempmail.wait_for_messages(email, max_wait=150, interval=5)
+                # Step 7: Wait for OTP, going back to re-trigger a fresh code
+                # when the mail does not turn up in time.
+                otp = None
+                for round_no in range(1, OTP_ROUNDS + 1):
+                    c.print("  :inbox_tray: Waiting for OTP email...")
+                    messages = await tempmail.wait_for_messages(
+                        email, max_wait=OTP_WAIT_SECONDS, interval=5
+                    )
+                    otp = tempmail.extract_otp(messages) if messages else None
+                    if otp:
+                        break
+                    if round_no == OTP_ROUNDS:
+                        break
 
-                if not messages:
-                    c.print("  :x: [red]No messages received — OTP timeout![/]")
-                    write_log(f"[{idx}] OTP timeout for {email}", "ERROR")
-                    await context.close()
-                    await browser.close()
-                    return None
+                    c.print("  :arrows_counterclockwise: No code yet — going back to resend...")
+                    write_log(
+                        f"[{idx}] No OTP in round {round_no}, retrying via back button",
+                        "WARNING",
+                    )
+                    if not await self._resend_verification(page, password):
+                        write_log(f"[{idx}] Resend round {round_no} failed", "WARNING")
+                        break
 
-                otp = tempmail.extract_otp(messages)
                 if not otp:
-                    c.print("  :x: [red]Could not extract OTP![/]")
-                    write_log(f"[{idx}] OTP extraction failed for {email}", "ERROR")
+                    c.print("  :x: [red]No OTP received — giving up![/]")
+                    write_log(f"[{idx}] OTP timeout for {email}", "ERROR")
                     await context.close()
                     await browser.close()
                     return None
@@ -219,6 +237,43 @@ class SignupManager:
             import traceback
             traceback.print_exc()
             return None
+
+    async def _resend_verification(self, page: Page, password: str) -> bool:
+        """Trigger a fresh verification code.
+
+        The OTP screen offers no resend button, only a back control that
+        returns to the password step. Re-submitting the password re-sends
+        the code, but it also means passing the slider captcha again.
+        """
+        back = await self._click(page, [
+            'button:has-text("返回")',
+            'a:has-text("返回")',
+            'span:has-text("返回")',
+            'button:has-text("Back")',
+        ])
+        if not back:
+            return False
+
+        await page.wait_for_timeout(3000)
+
+        pw = await page.query_selector("#basic_password")
+        if pw:
+            try:
+                await pw.click(force=True)
+                await page.keyboard.type(password, delay=20)
+            except Exception:
+                pass
+
+        await self._click(page, ['button:has-text("Continue")'])
+        await page.wait_for_timeout(4000)
+
+        await self._click(page, [
+            "#aliyunCaptcha-captcha-body",
+            'button:has-text("Click to verify")',
+        ])
+        await page.wait_for_timeout(3000)
+
+        return await solve_slider_local(page, max_attempts=5, console=self.console)
 
     @staticmethod
     async def _click(page: Page, selectors: list) -> Optional[str]:
