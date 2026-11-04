@@ -41,6 +41,10 @@ _FETCH_RETRIES = 3
 _HTTP_RETRIES = 3
 _RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
 
+# Per-request socket timeout. Healthy answers take ~0.3s; a dropped reply is
+# better detected quickly and retried than waited out.
+_REQUEST_TIMEOUT = 12.0
+
 # When every read in a wait window failed on the network, the inbox is not
 # empty — it is unreadable. Reporting "no mail" in that state makes the caller
 # re-send the code, which invalidates one that may already have been delivered.
@@ -261,7 +265,10 @@ class TempikClient:
         self._http = _KeepAlive(
             parsed.hostname or "",
             port=parsed.port or (80 if parsed.scheme == "http" else 443),
-            timeout=20.0,
+            # A healthy answer arrives in ~0.3s. When the uplink drops the
+            # reply, waiting 20s per attempt just delays the retry that would
+            # have worked; 12s is already ~40x the normal latency.
+            timeout=_REQUEST_TIMEOUT,
             tls=parsed.scheme != "http",
         )
 

@@ -26,15 +26,15 @@ class _BoomMailbox:
 
 class MailboxFailureTest(unittest.TestCase):
     def test_create_account_returns_none_instead_of_raising(self):
-        original = signup_mod.TempikClient
-        signup_mod.TempikClient = lambda *a, **k: _BoomMailbox()
+        original = signup_mod.tempmail_client
+        signup_mod.tempmail_client = lambda: _BoomMailbox()
         try:
             mgr = signup_mod.SignupManager(
                 None, True, Console(file=io.StringIO(), width=80)
             )
             result = asyncio.run(mgr.create_account(6))
         finally:
-            signup_mod.TempikClient = original
+            signup_mod.tempmail_client = original
         self.assertIsNone(result)
 
     def test_batch_keeps_going_after_one_account_raises(self):

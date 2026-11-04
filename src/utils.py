@@ -57,9 +57,36 @@ def load_jsonl(filepath: Path) -> list:
 
 # ================= GENERATORS =================
 def generate_password(length: int = 14) -> str:
-    """Generate a strong random password."""
-    chars = string.ascii_letters + string.digits + "!@#$%^&*"
-    return "".join(random.choices(chars, k=length))
+    """Generate a password that satisfies Qoder's policy by construction.
+
+    The rule is: longer than 8 characters, containing a digit, an uppercase
+    letter, a lowercase letter and a special character. Picking 14 characters
+    uniformly at random misses one of those classes surprisingly often —
+    ~11% of draws contain no digit and ~18% no special character — and the
+    signup form then refuses to advance with "The password must be longer than
+    8 characters and contain numbers, uppercase letters, lowercase letters,
+    and special characters". That was 3 of 5 failures in one run.
+
+    So: seed one character from each required class, fill the rest from the
+    whole pool, then shuffle so the seeded characters are not in fixed
+    positions.
+    """
+    upper = string.ascii_uppercase
+    lower = string.ascii_lowercase
+    digits = string.digits
+    special = "!@#$%^&*"
+
+    required = [
+        random.choice(upper),
+        random.choice(lower),
+        random.choice(digits),
+        random.choice(special),
+    ]
+
+    pool = upper + lower + digits + special
+    chars = required + [random.choice(pool) for _ in range(max(0, length - len(required)))]
+    random.shuffle(chars)
+    return "".join(chars)
 
 
 def generate_machine_id() -> str:

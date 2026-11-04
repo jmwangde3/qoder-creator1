@@ -72,6 +72,20 @@ BACK_SELECTORS = [
 ]
 
 
+# One client for the whole process. It owns a keep-alive connection and a
+# tempik session, so ten accounts cost one TLS handshake instead of ten — on a
+# link that drops a third of its packets, that is the difference between a
+# batch that finishes and one that stalls on the first request.
+_shared_tempmail: Optional[TempikClient] = None
+
+
+def tempmail_client() -> TempikClient:
+    global _shared_tempmail
+    if _shared_tempmail is None:
+        _shared_tempmail = TempikClient()
+    return _shared_tempmail
+
+
 class SignupManager:
     """Handle Qoder signup + PAT creation."""
 
@@ -105,7 +119,7 @@ class SignupManager:
         # to go.
         c.print(f"\n[bold cyan]Account #{idx}[/]")
         c.print("  :mailbox: Getting temp email...")
-        tempmail = TempikClient()
+        tempmail = tempmail_client()
         try:
             email = tempmail.create_inbox()
         except Exception as e:
@@ -496,9 +510,11 @@ class SignupManager:
             if not await page.query_selector("#basic_password"):
                 return True
 
+            detail = await self._field_error(page, "#basic_password")
             write_log(
                 f"[{idx}] Password step stuck after {clicked or 'no click'} "
-                f"(attempt {attempt}); buttons={await self._page_buttons(page)}",
+                f"(attempt {attempt}); buttons={await self._page_buttons(page)}"
+                + (f"; form says: {detail}" if detail else ""),
                 "WARNING",
             )
 
@@ -512,6 +528,29 @@ class SignupManager:
                 return True
 
         return False
+
+    @staticmethod
+    async def _field_error(page: Page, selector: str) -> str:
+        """The page's own words about a form field.
+
+        Logged when a step refuses to advance: "Continue did nothing" is far
+        less useful than the actual rule the field is complaining about.
+        """
+        try:
+            return await page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return '';
+                    const box = el.closest('form')
+                        || (el.parentElement && el.parentElement.parentElement)
+                        || el.parentElement;
+                    if (!box) return '';
+                    return (box.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240);
+                }""",
+                selector,
+            )
+        except Exception:
+            return ""
 
     @staticmethod
     async def _page_buttons(page: Page) -> list:
