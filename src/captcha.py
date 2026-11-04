@@ -24,6 +24,26 @@ MAX_BARREN_WAITS = 2
 SETTLE_TRIES = 5
 SETTLE_GAP_MS = 25
 
+# Drag control. 32 live drags delivered 1.7% more piece travel than cursor
+# travel on average (up to 4.4%), so the main gesture stops short and a
+# proportional loop walks the rest. The loop is the shape the upstream solver
+# used -- read the piece, move a fraction of what is left, read again -- which
+# needs no gain model and converges on a widget that delivers 0.95x or 1.05x.
+MAIN_DRAG_FRACTION = 0.92
+# 0.35 rather than 0.55: short corrections travel about 1.8x their cursor
+# delta on this widget, so a 0.55 step is 0.99 of the error -- critically
+# damped, and it spends all eight rounds oscillating within 2px. At 0.35 the
+# loop is firmly over-damped for both the 1.0x long-drag ratio and the 1.8x
+# short-step ratio, which is what the live trails actually show.
+TRIM_GAIN = 0.35
+TRIM_STEPS = 8
+# The smallest step the widget accepts moves the piece ~1.5 * 1.8 = 2.7px, so
+# a 1px tolerance is unreachable once the loop is inside 2px -- it bounces
+# across the gap for all eight rounds. 1.6px is within the grading tolerance
+# (live misses only start around 4px) and stops the loop instead.
+TRIM_TOLERANCE = 1.6
+TRIM_MAX_STEP = 40.0
+
 # Archive every challenge before dragging. Set to False once target
 # identification is trustworthy; until then the images are the only way to
 # tell "the drag missed" from "the solver aimed at the wrong x".
@@ -279,17 +299,52 @@ async def _smooth_move(
 
     for index in range(1, segments + 1):
         fraction = index / segments
-        eased = 1.0 - (1.0 - fraction) ** 2
+        # Smoothstep, not ease-out. A hand accelerates from rest and coasts
+        # into the gap; the old curve was fastest on its very first sample,
+        # which is the shape a generator produces. This matters because the
+        # endpoint is not what gets graded: a drag that landed 0.9px from the
+        # gap was still rejected with F001 (trajectory flag).
+        eased = fraction * fraction * (3.0 - 2.0 * fraction)
         x = from_x + (eased_to - from_x) * eased
         # steps=1: Playwright's own interpolation fires extra pointermove
         # events, and the live widget loses a slice of every one of them. A
         # 200px drag came up 43px short -- roughly 4px per interpolation
         # point -- so the fewer events, the closer the endpoint lands.
-        await page.mouse.move(x, y + (random.random() - 0.5) * 0.6, steps=1)
-        await page.wait_for_timeout(gap_ms)
+        await page.mouse.move(x, y + (random.random() - 0.5) * 1.6, steps=1)
+        pause = max(0, gap_ms + random.randint(-6, 10)) if gap_ms else 0
+        await page.wait_for_timeout(pause)
 
     if final_leg > 0.5:
         await page.mouse.move(to_x, y, steps=1)
+
+
+def plan_trim(
+    target: float,
+    landed: float,
+    cursor_x: float,
+    headroom: float,
+    boost: float = 1.0,
+) -> tuple[float, bool]:
+    """One proportional correction step for the drag loop.
+
+    Returns ``(next_cursor_x, done)``. The step is a fraction of the remaining
+    error rather than the error itself: the piece moves slightly more than the
+    cursor, so aiming straight at the remainder overshoots, and the widget then
+    refuses to come back in the small increments that a second correction
+    implies. A sub-pixel target is widened to the widget's sampling threshold,
+    otherwise the move is discarded and the loop spins.
+    """
+    error = target - landed
+    if abs(error) <= TRIM_TOLERANCE:
+        return cursor_x, True
+    delta = max(-TRIM_MAX_STEP, min(TRIM_MAX_STEP, error * TRIM_GAIN * boost))
+    next_cursor = min(cursor_x + delta, headroom)
+    # Widen anything the widget would round away. Its sampling threshold sits
+    # at a couple of pixels; a 0.8px step is a no-op that costs a round trip,
+    # so the floor is the threshold itself, not an arbitrary epsilon.
+    if abs(next_cursor - cursor_x) < 1.5:
+        next_cursor = min(cursor_x + (1.5 if error > 0 else -1.5), headroom)
+    return next_cursor, False
 
 
 SOLVER_JS = r"""
@@ -488,7 +543,7 @@ async (mode) => {
   const offset=minX||0;
   const displayLeft=(targetX-offset)*scale;
   return {
-    targetX,score:alt.bx>15?alt.best:found.best,
+    targetX,score:method==='gray-ncc'?found.best:alt.best,
     altX:alt.bx,altScore:alt.best,nccX:found.bx,nccScore:found.best,
     method,
     displayLeft:displayLeft<10?10:displayLeft,
@@ -498,6 +553,66 @@ async (mode) => {
   };
 }
 """
+
+
+_VERDICT_SINKS: dict[int, list[str]] = {}
+_VERDICT_HOOKED: set[int] = set()
+_VERDICT_DEBUG: list[str] = []
+
+_VERDICT_MEANING = {
+    "T001": "passed",
+    "F001": "flagged (trajectory or environment)",
+    "F015": "position off target",
+}
+
+
+def _install_verdict_hook(page) -> list[str]:
+    """Collect the Aliyun verdict for every submission on this page.
+
+    The challenge answers each drag with a VerifyCode, and that code is the
+    only signal separating "the piece stopped in the wrong place" (F015) from
+    "the trajectory was judged a bot" (F001). Without it a rejected attempt
+    looks identical either way, and the next change is a guess.
+    """
+    page_id = id(page)
+    sink = _VERDICT_SINKS.setdefault(page_id, [])
+    if page_id in _VERDICT_HOOKED:
+        return sink
+
+    async def on_response(response) -> None:
+        try:
+            url = response.url or ""
+            if "verify" not in url.lower() and "captcha" not in url.lower():
+                return
+            content_type = (response.headers or {}).get("content-type", "")
+            payload = None
+            try:
+                payload = await response.json()
+            except Exception:
+                try:
+                    payload = (await response.text())[:300]
+                except Exception:
+                    payload = None
+            _VERDICT_DEBUG.append(
+                f"{url.split('?')[0][-70:]}|{content_type[:30]}|{str(payload)[:160]}"
+            )
+            code = ""
+            if isinstance(payload, dict):
+                result = payload.get("Result")
+                if isinstance(result, dict):
+                    code = result.get("VerifyCode") or ""
+                elif isinstance(result, str):
+                    code = result
+                if not code:
+                    code = payload.get("result") or payload.get("VerifyCode") or ""
+            if isinstance(code, str) and code.strip():
+                sink.append(code.strip().upper())
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    _VERDICT_HOOKED.add(page_id)
+    return sink
 
 
 async def widget_state(page) -> dict:
@@ -561,9 +676,11 @@ async def solve_slider_local(
             console.print(" [dim]%s[/]" % message)
         write_log("Captcha: " + message, "INFO")
     barren_waits = 0
+    verdicts = _install_verdict_hook(page)
 
     for attempt in range(1, max_attempts + 1):
         emit(f"captcha attempt {attempt}/{max_attempts}")
+        verdict_mark = len(verdicts)
         try:
             try:
                 await page.click("#aliyunCaptcha-captcha-left", timeout=2000)
@@ -631,24 +748,25 @@ async def solve_slider_local(
             await page.mouse.down()
             await page.wait_for_timeout(60)
 
-            # Probe only to confirm the piece is listening. Do NOT derive a
-            # gear ratio from it: the handle has a drag-start deadzone of tens
-            # of pixels, so a short probe reads far below 1.0, and dividing by
-            # that multiplied the cursor travel until it clamped at the end of
-            # the track (target 219 -> landed 260, three times over).
-            # The piece follows the cursor 1:1 on this widget; the correction
-            # loop below absorbs whatever the deadzone swallowed.
+            # A short nudge confirms the drag reached the widget. It is not a
+            # gain measurement: the handle has a press-in deadzone of tens of
+            # pixels, so a 24px probe reads far below 1.0, and dividing by that
+            # once sent the cursor to the end of the track (target 219 -> 260,
+            # three times over). The closed loop below learns the real ratio
+            # from a full-length gesture instead.
             probe = 24.0
-            start_x = await _settled_x(page, tries=8, gap_ms=40)
-            await page.mouse.move(slider_x + probe, slider_y, steps=6)
-            first = await _settled_x(page, tries=10, gap_ms=40)
-            if start_x is None or first is None or first - start_x < 0.5:
+            # tries*gap must exceed _settled_x's 250ms floor, or the helper
+            # returns its last sample instead of a settled one.
+            base = await _settled_x(page, tries=8, gap_ms=40)
+            await page.mouse.move(slider_x + probe, slider_y, steps=1)
+            first = await _settled_x(page, tries=8, gap_ms=40)
+            if base is None or first is None or first - base < 0.5:
                 # Short of the deadzone: push further before calling it dead.
                 probe = 56.0
-                await page.mouse.move(slider_x + probe, slider_y, steps=8)
-                first = await _settled_x(page, tries=10, gap_ms=40)
+                await page.mouse.move(slider_x + probe, slider_y, steps=1)
+                first = await _settled_x(page, tries=8, gap_ms=40)
 
-            if start_x is None or first is None or first - start_x < 0.5:
+            if base is None or first is None or first - base < 0.5:
                 await page.mouse.up()
                 dumped = await _dump_dom(page, "no_follow")
                 emit("captcha puzzle did not follow the probe")
@@ -657,79 +775,41 @@ async def solve_slider_local(
                 await page.wait_for_timeout(1200)
                 continue
 
+            base = 0.0 if abs(base) < 0.5 else base
             view_w = float(result.get("viewW") or 0) or 1600.0
             headroom = view_w - 8.0
             cursor_x = slider_x + probe
-            landed = first
+            landed = first - base
 
-            # The solver's offset is already in CSS pixels, so the cursor
-            # travels exactly that far. One continuous eased arc, then a few
-            # 1:1 corrections.
-            target_cursor = min(slider_x + display_left, headroom)
-            distance = abs(target_cursor - cursor_x)
-            segments = max(4, min(10, int(distance / 28) or 4))
-            await _smooth_move(page, cursor_x, target_cursor, slider_y, segments)
-            cursor_x = target_cursor
-            # The piece keeps moving for a few hundred ms after the cursor
-            # stops. Reading too early returned a value ~12px behind, which
-            # made the learned offset wrong by exactly that much and sent
-            # every trim overshooting to the far side of the gap.
-            settled = await _settled_x(page, tries=14, gap_ms=50)
-            if settled is not None:
-                landed = settled
-
-            # The widget swallows part of a long drag: the same 200px gesture
-            # delivered 78-94% of the distance depending on how many pointer
-            # samples it saw. Re-issue the shortfall scaled by what it actually
-            # delivered, which converges in one extra pass, instead of nudging
-            # 7px at a time into a threshold that discards exactly 7px steps.
-            if display_left > 40 and landed:
-                delivered = landed / display_left
-                if 0.5 <= delivered < 0.93:
-                    need = (display_left - landed) / delivered
-                    extra = min(cursor_x + need, headroom)
-                    if extra - cursor_x > 1.0:
-                        await _smooth_move(
-                            page, cursor_x, extra, slider_y, segments=4
-                        )
-                        cursor_x = extra
-                        settled = await _settled_x(page, tries=14, gap_ms=50)
-                        if settled is not None:
-                            landed = settled
+            # Main gesture: stop 8% short. The piece runs slightly ahead of
+            # the cursor (1.7% mean over 32 live drags, up to 4.4%), so aiming
+            # at the full offset lands 3-9px past the gap -- and the widget
+            # will not take a 3px step back. Stopping short keeps every
+            # correction on the near side, where each step is a forward move
+            # large enough to survive the sampling threshold.
+            aim = min(slider_x + display_left * MAIN_DRAG_FRACTION, headroom)
+            if aim > cursor_x + 1.0:
+                segments = max(3, min(7, int((aim - cursor_x) / 34) or 3))
+                await _smooth_move(page, cursor_x, aim, slider_y, segments)
+                cursor_x = aim
+                # The piece keeps moving for a few hundred ms after the cursor
+                # stops; reading early returns a value ~12px behind and makes
+                # every correction oversized.
+                settled = await _settled_x(page, tries=12, gap_ms=50)
+                if settled is not None:
+                    landed = settled - base
 
             stuck = 0
             boost = 1.0
             trims = 0
             trail: list[str] = []
-            for _ in range(6):
-                error = display_left - landed
-                if abs(error) <= 1.0:
+            for _ in range(TRIM_STEPS):
+                next_cursor, done = plan_trim(
+                    display_left, landed, cursor_x, headroom, boost
+                )
+                if done:
                     break
-                # The piece trails the cursor by a fixed offset -- the press-in
-                # deadzone, spent once when the drag starts. Learn it from
-                # where the main drag ended and jump straight to the cursor
-                # position that puts the piece on the gap. Walking there in
-                # ~7px increments never converged: that is precisely the step
-                # size the widget discards, so every trim left the residue at
-                # 6-8px and the loop merely burned its six rounds.
-                offset = (cursor_x - slider_x) - landed
-                if stuck:
-                    # The previous step was below the widget's sampling
-                    # threshold and got discarded. Repeating the same absolute
-                    # target would repeat the same discard, so overshoot by a
-                    # growing factor and let the model take over again after
-                    # the piece actually moves.
-                    next_cursor = min(cursor_x + error * boost, headroom)
-                else:
-                    next_cursor = min(slider_x + display_left + offset, headroom)
-                    if abs(next_cursor - cursor_x) > 3.0 * abs(
-                        error
-                    ) or abs(next_cursor - cursor_x) < 1.0:
-                        # The offset model does not explain this reading; fall
-                        # back to stepping by the error itself.
-                        next_cursor = min(cursor_x + error, headroom)
-                moved_cursor = next_cursor - cursor_x
-                if abs(moved_cursor) < 1.0:
+                if abs(next_cursor - cursor_x) < 0.5:
                     dumped = await _dump_dom(page, "edge")
                     emit(
                         f"captcha cursor cannot travel further at "
@@ -739,25 +819,27 @@ async def solve_slider_local(
                         emit(f"captcha widget geometry saved to {dumped}")
                     break
                 previous = landed
-                # One pointermove, not an eased arc. Every event the widget
-                # sees adds a small fixed offset on top of the pointer delta,
-                # so a 3-event trim of 18px delivered 33px of piece movement
-                # (gain 1.83) while an 8-event 238px drag delivered 256px
-                # (gain 1.08). Fewer events means the correction lands where
-                # it is aimed instead of overshooting to the far side.
+                # One pointermove per correction. Every extra event adds a
+                # slice of travel the widget did not ask for -- an 18px trim
+                # split over three events delivered 33px -- and overshooting
+                # here costs the whole attempt.
                 await page.mouse.move(
                     next_cursor, slider_y + (random.random() - 0.5) * 0.6, steps=1
                 )
                 cursor_x = next_cursor
                 trims += 1
-                trail.append(f"{error:+.1f}/{landed:.1f}")
+                trail.append(f"{previous - display_left:+.1f}/{previous:.1f}")
                 settled = await _settled_x(page, tries=10, gap_ms=50)
                 if settled is None:
                     break
-                landed = settled
-                if abs(landed - previous) < 0.5:
+                landed = settled - base
+                if abs(landed - previous) < 0.4:
+                    # The step was below the widget's sampling threshold and
+                    # got discarded. Repeating it verbatim repeats the discard,
+                    # so widen the next one until the piece moves again.
                     stuck += 1
-                    if stuck >= 3:
+                    boost = min(boost * 2.2, 6.0)
+                    if stuck >= 4:
                         dumped = await _dump_dom(page, "stalled")
                         emit(
                             f"captcha piece stopped responding at "
@@ -766,7 +848,6 @@ async def solve_slider_local(
                         if dumped:
                             emit(f"captcha widget geometry saved to {dumped}")
                         break
-                    boost = min(boost * 3.0, 16.0)
                 else:
                     stuck = 0
                     boost = 1.0
@@ -782,6 +863,14 @@ async def solve_slider_local(
                 f"bgW={result['bgDisplayW']:.0f} handleW={result['sliderW']:.0f}"
             )
             await page.wait_for_timeout(2500)
+            if len(verdicts) > verdict_mark:
+                code = verdicts[-1]
+                emit(
+                    f"captcha verdict={code} "
+                    f"({_VERDICT_MEANING.get(code, 'unknown')})"
+                )
+            elif _VERDICT_DEBUG:
+                emit("captcha verdict=none; saw " + " || ".join(_VERDICT_DEBUG[-3:]))
             if await is_solved(page):
                 emit("captcha solved")
                 return True
