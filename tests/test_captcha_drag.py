@@ -114,37 +114,81 @@ class PlanTrimTest(unittest.TestCase):
         cursor, _ = plan_trim(300.0, 0.0, 1500.0, 1500.0)
         self.assertEqual(cursor, 1500.0)
 
-    def test_boost_widens_a_discarded_step(self):
-        plain, _ = plan_trim(200.0, 195.0, 500.0, 2000.0)
-        boosted, _ = plan_trim(200.0, 195.0, 500.0, 2000.0, boost=2.2)
-        self.assertGreater(boosted - 500.0, plain - 500.0)
+    def test_discarded_step_remeasures_from_the_accepted_cursor(self):
+        # The cursor moved 10px but the widget dropped the step: the reading
+        # still belongs to the cursor from before it. Aiming from the new
+        # cursor would skip 10px of the error twice over.
+        stuck_cursor, _ = plan_trim(
+            200.0, 195.0, 510.0, 2000.0, applied_cursor=500.0, stuck=True
+        )
+        self.assertAlmostEqual(stuck_cursor - 500.0, 5.0, delta=0.01)
+        # And the stuck step is not damped: a widget that discards small
+        # deltas will not integrate a creeping approach either.
+        self.assertGreater(stuck_cursor - 500.0, 4.6)
 
     def test_converges_when_the_piece_runs_ahead(self):
         # Two ratios matter. A long main drag delivers ~1.0-1.1x of the cursor
         # travel; a short correction delivers up to ~1.8x (measured trails:
-        # a 21px cursor step moved the piece 38px). The loop must be stable
-        # against both without knowing which one it is in.
+        # a 7.6px trim moved the piece 14.4px, a 27.2px one moved it 48.8px).
+        # The loop must be stable against both without knowing which it is in.
         for gain_main in (1.0, 1.06, 1.10):
             for gain_trim in (1.0, 1.4, 1.8):
                 for target in (60.0, 140.0, 220.0, 248.0):
                     landed = target * MAIN_DRAG_FRACTION * gain_main
                     cursor = target * MAIN_DRAG_FRACTION
+                    applied = cursor
                     for _ in range(TRIM_STEPS):
-                        nxt, done = plan_trim(target, landed, cursor, 5000.0)
+                        nxt, done = plan_trim(
+                            target, landed, cursor, 5000.0, applied_cursor=applied
+                        )
                         if done:
                             break
                         step = nxt - cursor
+                        previous = landed
                         # The widget drops sub-threshold deltas and quantises
                         # what it accepts to half a pixel.
                         if abs(step) >= 1.5:
                             landed = round((landed + step * gain_trim) * 2.0) / 2.0
                         cursor = nxt
+                        # A discarded step leaves `applied` behind; an accepted
+                        # one re-anchors it where the reading came from.
+                        applied = applied if abs(landed - previous) < 0.4 else cursor
                     self.assertLessEqual(
                         abs(target - landed),
                         2.0,
                         f"main={gain_main} trim={gain_trim} "
                         f"target={target} landed={landed}",
                     )
+
+    def test_discard_does_not_drift_the_cursor_off_the_reading(self):
+        # One step in the middle is discarded. The loop must re-measure from
+        # the cursor that produced the reading instead of the one that kept
+        # moving, and still land on the gap within a dozen rounds.
+        for target in (80.0, 160.0, 240.0):
+            landed = 0.0
+            cursor = 0.0
+            applied = 0.0
+            for round_no in range(1, TRIM_STEPS + 1):
+                nxt, done = plan_trim(
+                    target, landed, cursor, 5000.0, applied_cursor=applied
+                )
+                if done:
+                    break
+                step = nxt - cursor
+                previous = landed
+                # The widget honours deltas of ~1.5px and delivers ~1.8x; the
+                # fifth step is swallowed whole, as seen once in the live
+                # trails.
+                if round_no != 5 and abs(step) >= 1.5:
+                    landed = round((landed + step * 1.8) * 2.0) / 2.0
+                cursor = nxt
+                if landed != previous:
+                    applied = cursor
+            self.assertLessEqual(
+                abs(target - landed),
+                3.0,
+                f"target={target} landed={landed}",
+            )
 
 
 if __name__ == "__main__":

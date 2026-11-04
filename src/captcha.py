@@ -31,18 +31,23 @@ SETTLE_GAP_MS = 25
 # needs no gain model and converges on a widget that delivers 0.95x or 1.05x.
 MAIN_DRAG_FRACTION = 0.92
 # 0.35 rather than 0.55: short corrections travel about 1.8x their cursor
-# delta on this widget, so a 0.55 step is 0.99 of the error -- critically
-# damped, and it spends all eight rounds oscillating within 2px. At 0.35 the
-# loop is firmly over-damped for both the 1.0x long-drag ratio and the 1.8x
-# short-step ratio, which is what the live trails actually show.
+# delta on this widget (7.6px -> 14.4px, 27.2px -> 48.8px), so a 0.55 step is
+# 0.99 of the error -- critically damped, and it spends all its rounds
+# oscillating within 2px. At 0.35 the loop is firmly over-damped for both the
+# 1.0x long-drag ratio and the 1.8x short-step ratio, which is what the live
+# trails actually show.
 TRIM_GAIN = 0.35
-TRIM_STEPS = 8
-# The smallest step the widget accepts moves the piece ~1.5 * 1.8 = 2.7px, so
-# a 1px tolerance is unreachable once the loop is inside 2px -- it bounces
-# across the gap for all eight rounds. 1.6px is within the grading tolerance
-# (live misses only start around 4px) and stops the loop instead.
+# 12 rounds, not 8: at 35% damping a strictly 1:1 widget (the local mocks)
+# closes only 65% of the gap per round, so eight rounds stop ~2px short on a
+# large residue. The live widget delivers 1.8x per step and is done in 3-5.
+TRIM_STEPS = 12
+# The smallest single pointermove the widget honours; anything shorter is
+# discarded without a trace. Its piece-side cost is 1.5 * 1.8 = 2.7px, so a
+# 1px tolerance is unreachable once the loop is inside 2px -- it bounces
+# across the gap for every round it has. 1.6px is within the grading
+# tolerance (live misses only start around 4px) and stops the loop instead.
+MIN_TRIM_STEP = 1.5
 TRIM_TOLERANCE = 1.6
-TRIM_MAX_STEP = 40.0
 
 # Archive every challenge before dragging. Set to False once target
 # identification is trustworthy; until then the images are the only way to
@@ -323,7 +328,8 @@ def plan_trim(
     landed: float,
     cursor_x: float,
     headroom: float,
-    boost: float = 1.0,
+    applied_cursor: float | None = None,
+    stuck: bool = False,
 ) -> tuple[float, bool]:
     """One proportional correction step for the drag loop.
 
@@ -331,19 +337,29 @@ def plan_trim(
     error rather than the error itself: the piece moves slightly more than the
     cursor, so aiming straight at the remainder overshoots, and the widget then
     refuses to come back in the small increments that a second correction
-    implies. A sub-pixel target is widened to the widget's sampling threshold,
-    otherwise the move is discarded and the loop spins.
+    implies. A sub-threshold target is widened to the widget's sampling
+    threshold, otherwise the move is discarded and the loop spins.
+
+    ``applied_cursor`` is the cursor position that *produced* ``landed``.
+    When a step is discarded the cursor has already moved on but the reading
+    has not, so measuring the shortfall from ``cursor_x`` would double-count
+    the discarded distance. The caller passes the cursor as of the last step
+    the widget actually accepted.
     """
     error = target - landed
     if abs(error) <= TRIM_TOLERANCE:
         return cursor_x, True
-    delta = max(-TRIM_MAX_STEP, min(TRIM_MAX_STEP, error * TRIM_GAIN * boost))
-    next_cursor = min(cursor_x + delta, headroom)
-    # Widen anything the widget would round away. Its sampling threshold sits
-    # at a couple of pixels; a 0.8px step is a no-op that costs a round trip,
-    # so the floor is the threshold itself, not an arbitrary epsilon.
-    if abs(next_cursor - cursor_x) < 1.5:
-        next_cursor = min(cursor_x + (1.5 if error > 0 else -1.5), headroom)
+    if stuck:
+        # The widget drops small deltas outright, so creeping is impossible:
+        # aim straight at the cursor position that maps onto the gap,
+        # measured from where the accepted reading was taken.
+        next_cursor = min(applied_cursor + error, headroom)
+    else:
+        next_cursor = min(cursor_x + error * TRIM_GAIN, headroom)
+    if abs(next_cursor - cursor_x) < MIN_TRIM_STEP:
+        next_cursor = min(
+            cursor_x + (MIN_TRIM_STEP if error > 0 else -MIN_TRIM_STEP), headroom
+        )
     return next_cursor, False
 
 
@@ -800,12 +816,21 @@ async def solve_slider_local(
                     landed = settled - base
 
             stuck = 0
-            boost = 1.0
             trims = 0
+            # The cursor position that produced the current `landed`. A step
+            # the widget discards still moves the cursor, so attributing the
+            # reading to it would double-count the discarded distance on the
+            # next correction.
+            applied_cursor = cursor_x
             trail: list[str] = []
             for _ in range(TRIM_STEPS):
                 next_cursor, done = plan_trim(
-                    display_left, landed, cursor_x, headroom, boost
+                    display_left,
+                    landed,
+                    cursor_x,
+                    headroom,
+                    applied_cursor=applied_cursor,
+                    stuck=bool(stuck),
                 )
                 if done:
                     break
@@ -835,11 +860,12 @@ async def solve_slider_local(
                 landed = settled - base
                 if abs(landed - previous) < 0.4:
                     # The step was below the widget's sampling threshold and
-                    # got discarded. Repeating it verbatim repeats the discard,
-                    # so widen the next one until the piece moves again.
+                    # got discarded: the reading still belongs to
+                    # `applied_cursor`, so keep it and let the next step aim
+                    # further. The widget is not integrating small deltas at
+                    # all, so plan_trim switches to a full-error step.
                     stuck += 1
-                    boost = min(boost * 2.2, 6.0)
-                    if stuck >= 4:
+                    if stuck >= 5:
                         dumped = await _dump_dom(page, "stalled")
                         emit(
                             f"captcha piece stopped responding at "
@@ -850,7 +876,7 @@ async def solve_slider_local(
                         break
                 else:
                     stuck = 0
-                    boost = 1.0
+                    applied_cursor = cursor_x
 
             await page.mouse.up()
             residual = float("nan") if landed is None else display_left - landed

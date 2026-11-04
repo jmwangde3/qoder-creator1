@@ -17,7 +17,15 @@ from .utils import write_log, generate_password, save_jsonl
 from .tempmail import TempikClient, sent_at_stamp
 from .proxy import ProxyPool
 from .stealth import create_stealth_context, launch_stealth_browser
-from .captcha import solve_slider_local, dump_widget_state
+
+# A/B switch for the slider. `legacy` runs the implementation the fork shipped
+# in 34f9f64, untouched, so both can be measured through the same signup flow.
+import os as _os  # noqa: E402
+
+if _os.environ.get("QODER_CAPTCHA_IMPL", "").lower() == "legacy":
+    from .captcha_legacy import solve_slider_local, dump_widget_state
+else:
+    from .captcha import solve_slider_local, dump_widget_state
 from .pat import PATManager
 
 # Qoder's verification screen has no "resend" control. The only way to get a
