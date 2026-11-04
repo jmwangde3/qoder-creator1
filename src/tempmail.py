@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from typing import List, Optional, Dict, Any
 
-from .config import TEMPIK_BASE
+from .config import TEMPIK_BASE, DATA_DIR
 from .utils import write_log
 from urllib.parse import urlparse
 
@@ -85,6 +85,34 @@ def sent_at_stamp() -> str:
     return utc_stamp(-_CLOCK_SKEW)
 
 
+# Resolving costs a round trip to the resolver and sometimes fails outright on
+# this network: measured here, five consecutive lookups each burned 11 seconds
+# and then failed, before the sixth answered. The answer rarely changes, so it
+# is cached for the process *and* on disk — a later run can start without
+# asking DNS at all.
+_DNS_TTL = 600
+_DNS_CACHE: Dict[str, tuple] = {}
+_DNS_FILE = DATA_DIR / "dns_cache.json"
+
+
+def _load_dns_file() -> Dict[str, str]:
+    try:
+        data = json.loads(_DNS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_dns_file(host: str, ip: str) -> None:
+    try:
+        data = _load_dns_file()
+        data[host] = ip
+        _DNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _DNS_FILE.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class _KeepAlive:
     """One HTTPS connection, kept open and rebuilt only when it breaks.
 
@@ -111,11 +139,63 @@ class _KeepAlive:
     def _resolve(self) -> str:
         if self._ip:
             return self._ip
-        infos = socket.getaddrinfo(
-            self.host, self.port, socket.AF_INET, socket.SOCK_STREAM
-        )
-        self._ip = infos[0][4][0]
-        return self._ip
+
+        now = time.time()
+        cached = _DNS_CACHE.get(self.host)
+        if cached and cached[1] > now:
+            self._ip = cached[0]
+            return self._ip
+
+        last: Optional[Exception] = None
+        persisted = _load_dns_file().get(self.host)
+        rounds = 1 if persisted else 2
+
+        for attempt in range(1, rounds + 1):
+            try:
+                infos = socket.getaddrinfo(
+                    self.host, self.port, socket.AF_INET, socket.SOCK_STREAM
+                )
+                return self._remember(infos[0][4][0])
+            except Exception as e:
+                last = e
+
+            # Some resolvers answer AAAA only for a moment; the A-filtered
+            # query then fails with "getaddrinfo failed" even though the name
+            # does resolve. Ask again unfiltered and take an IPv4 answer if one
+            # is present, since this host's IPv6 route to Cloudflare is broken.
+            try:
+                infos = socket.getaddrinfo(
+                    self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM
+                )
+                v4 = [i for i in infos if i[0] == socket.AF_INET]
+                if v4:
+                    return self._remember(v4[0][4][0])
+            except Exception as e:
+                last = e
+
+            write_log(
+                f"DNS lookup for {self.host} failed (attempt {attempt}/{rounds}): "
+                f"{last}",
+                "WARNING",
+            )
+            time.sleep(0.5 * attempt)
+
+        if persisted:
+            write_log(
+                f"DNS unavailable; using the last known address for "
+                f"{self.host} ({persisted})",
+                "WARNING",
+            )
+            self._ip = persisted
+            return persisted
+
+        raise last  # type: ignore[misc]
+
+    def _remember(self, ip: str) -> str:
+        self._ip = ip
+        _DNS_CACHE[self.host] = (ip, time.time() + _DNS_TTL)
+        _save_dns_file(self.host, ip)
+        return ip
 
     def close(self) -> None:
         if self._conn is not None:

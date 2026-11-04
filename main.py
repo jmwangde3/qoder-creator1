@@ -28,7 +28,7 @@ from rich.text import Text
 from src.config import (
     DATA_DIR, ACCOUNTS_FILE, PROXY_FILE, LOG_FILE, PROXY_MODE, HEADLESS,
 )
-from src.utils import setup_logging, load_jsonl
+from src.utils import setup_logging, load_jsonl, write_log
 from src.proxy import ProxyPool
 from src.signup import create_accounts, SignupManager
 
@@ -80,7 +80,13 @@ async def menu_signup():
 
         results = []
         for i in range(count):
-            result = await manager.create_account(i + 1)
+            # One failing account must not end the batch: a DNS hiccup while
+            # creating the mailbox killed a 10-account run on #6 before this.
+            try:
+                result = await manager.create_account(i + 1)
+            except Exception as e:
+                write_log(f"[{i + 1}] Unhandled signup error: {e}", "ERROR")
+                result = None
             if result:
                 results.append(result)
             progress.advance(task)
@@ -118,7 +124,13 @@ async def menu_signup_cli(count: int):
 
         results = []
         for i in range(count):
-            result = await manager.create_account(i + 1)
+            # One failing account must not end the batch: a DNS hiccup while
+            # creating the mailbox killed a 10-account run on #6 before this.
+            try:
+                result = await manager.create_account(i + 1)
+            except Exception as e:
+                write_log(f"[{i + 1}] Unhandled signup error: {e}", "ERROR")
+                result = None
             if result:
                 results.append(result)
             progress.advance(task)

@@ -99,11 +99,20 @@ class SignupManager:
 
         c = self.console
 
-        # Step 1: Get temp email
+        # Step 1: Get temp email. This used to sit outside the try block, so a
+        # DNS hiccup while creating the mailbox escaped create_account() and
+        # killed the whole batch — a 10-account run died on #6 with nine still
+        # to go.
         c.print(f"\n[bold cyan]Account #{idx}[/]")
         c.print("  :mailbox: Getting temp email...")
         tempmail = TempikClient()
-        email = tempmail.create_inbox()
+        try:
+            email = tempmail.create_inbox()
+        except Exception as e:
+            c.print("  :x: [red]Could not get a temp mailbox[/]")
+            write_log(f"[{idx}] Temp mailbox unavailable: {e}", "ERROR")
+            return None
+
         password = generate_password()
 
         c.print(f"  :envelope: Email: [cyan]{email}[/]")
@@ -576,7 +585,11 @@ async def create_accounts(
     results = []
 
     for i in range(count):
-        result = await manager.create_account(i + 1)
+        try:
+            result = await manager.create_account(i + 1)
+        except Exception as e:  # keep going: one bad account is not fatal
+            write_log(f"[{i + 1}] Unhandled signup error: {e}", "ERROR")
+            result = None
         if result:
             results.append(result)
 
