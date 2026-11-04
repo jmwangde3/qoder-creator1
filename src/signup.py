@@ -14,7 +14,7 @@ from rich.text import Text
 
 from .config import QODER_BASE, ACCOUNTS_FILE
 from .utils import write_log, generate_password, save_jsonl
-from .tempmail import TempikClient
+from .tempmail import TempikClient, sent_at_stamp
 from .proxy import ProxyPool
 from .stealth import create_stealth_context, launch_stealth_browser
 from .captcha import solve_slider_local, dump_widget_state
@@ -24,8 +24,28 @@ from .pat import PATManager
 # fresh code is to hit the back button, re-submit the password and pass the
 # slider again. The very first send is sometimes lost entirely, so give the
 # mail a limited window before falling back to that.
-OTP_WAIT_SECONDS = 45
+OTP_WAIT_SECONDS = 60
 OTP_ROUNDS = 3  # initial send + 2 re-sends
+
+# How long the OTP screen may take to accept or reject a code. It auto-submits
+# once the sixth digit is typed, so the verdict usually lands within a second.
+OTP_RESULT_SECONDS = 20
+
+# Wording the verification screen uses when the code is wrong. A rejected code
+# means the account is not verified, and creating a PAT then answers 401 while
+# the run still reports success — so it has to be detected, not ignored.
+OTP_ERROR_HINTS = (
+    "invalid or incorrect",
+    "verification code is invalid",
+    "invalid verification code",
+    "invalid code",
+    "incorrect code",
+    "code is incorrect",
+    "code is invalid",
+    "验证码无效",
+    "验证码错误",
+    "验证码不正确",
+)
 
 # The OTP screen's back control is a plain text link, not a <button> — the
 # tag differs between locales/releases, so match on text and let Playwright
@@ -124,6 +144,10 @@ class SignupManager:
 
                 # Step 5: Fill password
                 c.print("  :lock: Filling password...")
+                # Submitting this step is what asks Qoder for a code, so the
+                # clock starts here: anything received before now was issued
+                # for an earlier request and is already dead.
+                send_at = sent_at_stamp()
                 if not await self._fill_password_step(page, password, idx):
                     c.print("  :x: [red]Password step would not advance![/]")
                     write_log(f"[{idx}] Password step stuck for {email}", "ERROR")
@@ -133,7 +157,7 @@ class SignupManager:
                     return None
 
                 # Step 6: Solve captcha
-                c.print("  :puzzle_piece: Solving captcha...")
+                c.print("  :jigsaw: Solving captcha...")
                 await self._click(page, [
                     "#aliyunCaptcha-captcha-body",
                     "#aliyunCaptcha-captcha-left",
@@ -164,78 +188,105 @@ class SignupManager:
                 c.print("  :white_check_mark: [green]Captcha solved![/]")
                 await page.wait_for_timeout(2000)
 
-                # Step 7: Wait for OTP, going back to re-trigger a fresh code
-                # when the mail does not turn up in time.
+                # Step 7: Wait for the code, going back to re-trigger one when
+                # the mail does not turn up — and, when the page rejects a
+                # code, retrying with a genuinely new one instead of carrying
+                # on as if the account were verified.
                 otp = None
+                attempted = set()
+                accepted = False
+
                 for round_no in range(1, OTP_ROUNDS + 1):
                     c.print("  :inbox_tray: Waiting for OTP email...")
                     messages = await tempmail.wait_for_messages(
-                        email, max_wait=OTP_WAIT_SECONDS, interval=5
+                        email,
+                        max_wait=OTP_WAIT_SECONDS,
+                        interval=5,
+                        since=send_at,
                     )
                     otp = tempmail.extract_otp(messages) if messages else None
+
+                    if otp and otp in attempted:
+                        write_log(
+                            f"[{idx}] Ignoring already-tried code {otp}", "WARNING"
+                        )
+                        otp = None
+
                     if otp:
-                        break
+                        attempted.add(otp)
+                        c.print(f"  :incoming_envelope: OTP: [bold green]{otp}[/]")
+                        outcome = await self._submit_otp(page, otp)
+                        if outcome == "rejected":
+                            c.print("  :x: [red]Code rejected by the page[/]")
+                            write_log(
+                                f"[{idx}] OTP {otp} rejected by the verification "
+                                f"screen (round {round_no})",
+                                "ERROR",
+                            )
+                            await self._snapshot(page, f"{idx}_otp_rejected")
+                            otp = None
+                        else:
+                            if outcome == "unknown":
+                                write_log(
+                                    f"[{idx}] OTP outcome unknown — the page neither "
+                                    "advanced nor showed an error",
+                                    "WARNING",
+                                )
+                            accepted = True
+                            break
+
                     if round_no == OTP_ROUNDS:
                         break
 
-                    c.print("  :arrows_counterclockwise: No code yet — going back to resend...")
+                    c.print("  :arrows_counterclockwise: No usable code — going back to resend...")
                     write_log(
-                        f"[{idx}] No OTP in round {round_no}, retrying via back button",
+                        f"[{idx}] No usable OTP in round {round_no}, "
+                        "retrying via back button",
                         "WARNING",
                     )
-                    if not await self._resend_verification(page, password):
+                    resumed_at = await self._resend_verification(page, password)
+                    if not resumed_at:
                         write_log(f"[{idx}] Resend round {round_no} failed", "WARNING")
                         break
+                    send_at = resumed_at
 
-                if not otp:
-                    c.print("  :x: [red]No OTP received — giving up![/]")
-                    write_log(f"[{idx}] OTP timeout for {email}", "ERROR")
+                if not accepted:
+                    c.print("  :x: [red]No usable OTP — giving up![/]")
+                    write_log(f"[{idx}] OTP failed for {email}", "ERROR")
                     await context.close()
                     await browser.close()
                     return None
 
-                c.print(f"  :incoming_envelope: OTP: [bold green]{otp}[/]")
-
-                # Step 8: Fill OTP
-                c.print("  :keyboard: Filling OTP...")
-                otp_inputs = await page.query_selector_all('input.ant-otp-input')
-                if len(otp_inputs) >= 6:
-                    await otp_inputs[0].click()
-                    await page.wait_for_timeout(200)
-                    await page.keyboard.type(otp, delay=80)
-                    await page.wait_for_timeout(1500)
-                else:
-                    all_inputs = await page.query_selector_all('input:not([type="hidden"])')
-                    if all_inputs:
-                        await all_inputs[0].click()
-                        await page.keyboard.type(otp, delay=80)
-                    else:
-                        await page.keyboard.type(otp, delay=80)
-
-                await self._click(page, [
-                    'button:has-text("Create account")',
-                    'button:has-text("Verify")',
-                    'button[type="submit"]',
-                ])
-                await page.wait_for_timeout(8000)
-
-                # Step 9: Check result
+                # Step 8: Report where the flow landed.
                 current_url = page.url
                 if "download" in current_url or "dashboard" in current_url:
                     c.print("  :white_check_mark: [bold green]Account created![/]")
                 else:
                     c.print("  :warning: [yellow]Account may be pending...[/]")
 
-                # Step 10: Create PAT
+                # Step 9: Create PAT. An unverified session answers 401, and
+                # that used to be written out as a successful account with an
+                # empty token, so it is now a hard failure.
                 c.print("  :shield: Creating PAT...")
                 pat_response = await PATManager.create(page, "farm")
                 pat_token = PATManager.extract_token(pat_response)
                 pat_valid = PATManager.is_valid(pat_response)
 
-                if pat_valid:
-                    c.print(f"  :white_check_mark: [green]PAT valid! ({len(pat_token)} chars)[/]")
-                else:
-                    c.print(f"  :x: [yellow]PAT invalid: {pat_response.get('status')}[/]")
+                if not pat_valid:
+                    status = pat_response.get("status")
+                    body = (pat_response.get("body") or "")[:200]
+                    c.print(f"  :x: [red]PAT failed: {status}[/]")
+                    write_log(
+                        f"[{idx}] PAT creation failed for {email}: status={status} "
+                        f"body={body}",
+                        "ERROR",
+                    )
+                    await self._snapshot(page, f"{idx}_pat")
+                    await context.close()
+                    await browser.close()
+                    return None
+
+                c.print(f"  :white_check_mark: [green]PAT valid! ({len(pat_token)} chars)[/]")
 
                 await context.close()
                 await browser.close()
@@ -263,17 +314,21 @@ class SignupManager:
             traceback.print_exc()
             return None
 
-    async def _resend_verification(self, page: Page, password: str) -> bool:
+    async def _resend_verification(self, page: Page, password: str) -> Optional[str]:
         """Trigger a fresh verification code.
 
         The OTP screen offers no resend button, only a back link that
         returns to the password step. Re-submitting the password re-sends
-        the code, but it also means passing the slider captcha again.
+        the code, but it also means passing the slider captcha again — and it
+        invalidates whatever code was issued before, which is why the caller
+        gets the send timestamp back and ignores older mail.
         """
+        send_at = sent_at_stamp()
+
         back = await self._click(page, BACK_SELECTORS)
         if not back:
             write_log("Back control not found on the OTP screen", "WARNING")
-            return False
+            return None
         write_log(f"Resend: clicked back via {back}", "INFO")
 
         # Make sure the click really landed on the password step — typing into
@@ -282,11 +337,11 @@ class SignupManager:
             await page.wait_for_selector("#basic_password", timeout=10000)
         except Exception:
             write_log("Back did not lead to the password step", "WARNING")
-            return False
+            return None
 
         if not await self._fill_password_step(page, password):
             write_log("Resend: password step would not advance", "WARNING")
-            return False
+            return None
 
         await self._click(page, [
             "#aliyunCaptcha-captcha-body",
@@ -294,7 +349,69 @@ class SignupManager:
         ])
         await page.wait_for_timeout(3000)
 
-        return await solve_slider_local(page, max_attempts=5, console=self.console)
+        if not await solve_slider_local(page, max_attempts=5, console=self.console):
+            return None
+
+        write_log(f"Resend: fresh code requested at {send_at}", "INFO")
+        return send_at
+
+    async def _submit_otp(self, page: Page, otp: str) -> str:
+        """Type the code and report what the page did with it.
+
+        Returns "ok", "rejected" or "unknown". The live screen has no submit
+        button — it posts the moment the sixth digit lands — while older
+        builds do have one, so a click is attempted only when nothing has
+        happened yet.
+        """
+        c = self.console
+        c.print("  :keyboard: Filling OTP...")
+        try:
+            otp_inputs = await page.query_selector_all("input.ant-otp-input")
+            if len(otp_inputs) >= 6:
+                await otp_inputs[0].click()
+                await page.wait_for_timeout(200)
+                await page.keyboard.type(otp, delay=80)
+            else:
+                all_inputs = await page.query_selector_all('input:not([type="hidden"])')
+                if all_inputs:
+                    await all_inputs[0].click()
+                    await page.keyboard.type(otp, delay=80)
+                else:
+                    await page.keyboard.type(otp, delay=80)
+        except Exception as e:
+            write_log(f"OTP typing failed: {e}", "ERROR")
+            return "unknown"
+
+        outcome = await self._otp_outcome(page, timeout=2)
+        if outcome == "unknown":
+            await self._click(page, [
+                'button:has-text("Create account")',
+                'button:has-text("Verify")',
+                'button[type="submit"]',
+            ])
+            outcome = await self._otp_outcome(page, timeout=OTP_RESULT_SECONDS)
+        return outcome
+
+    async def _otp_outcome(self, page: Page, timeout: float = OTP_RESULT_SECONDS) -> str:
+        """Watch the verification screen: "ok", "rejected" or "unknown"."""
+        deadline = time.time() + timeout
+        while True:
+            try:
+                if not any(
+                    k in page.url for k in ("sign-up", "signup", "verify")
+                ):
+                    return "ok"
+                if not await page.query_selector("input.ant-otp-input"):
+                    return "ok"
+                text = ((await page.inner_text("body")) or "").lower()
+                if any(hint in text for hint in OTP_ERROR_HINTS):
+                    return "rejected"
+            except Exception:
+                pass
+
+            if time.time() >= deadline:
+                return "unknown"
+            await page.wait_for_timeout(600)
 
     async def _fill_password_step(self, page: Page, password: str, idx: int = 0) -> bool:
         """Fill the password field and confirm the step actually advanced.

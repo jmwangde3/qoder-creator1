@@ -36,6 +36,17 @@ _FETCH_RETRIES = 3
 _HTTP_RETRIES = 3
 _RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
 
+# When every read in a wait window failed on the network, the inbox is not
+# empty — it is unreadable. Reporting "no mail" in that state makes the caller
+# re-send the code, which invalidates one that may already have been delivered.
+# Give an unreachable inbox one extra window before saying anything.
+_UNREADABLE_GRACE = 60
+
+# Our clock and Cloudflare's are both NTP-synced but not identical; ignore a
+# few seconds of skew when comparing a local send time to a server receipt
+# time, so a fresh mail can never be filtered out by a fast local clock.
+_CLOCK_SKEW = 5
+
 # Text that introduces a verification code. Qoder's mail is localised, so the
 # English-only phrases the original regex looked for never show up — match the
 # Chinese wording too.
@@ -52,6 +63,21 @@ _OTP_TEXT_HINTS = (
     "qoder", "验证码", "verification code", "verify your email",
     "otp", "passcode", "one-time",
 )
+
+
+# ==================== HELPERS ====================
+def utc_stamp(offset: float = 0.0) -> str:
+    """Timestamp in the format tempik stores in messages.received_at."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + offset))
+
+
+def sent_at_stamp() -> str:
+    """Stamp to pass as `since` when a code request is about to be triggered.
+
+    Skew-tolerant: a mail that left the server a moment before our own clock
+    reported the send must still count as fresh.
+    """
+    return utc_stamp(-_CLOCK_SKEW)
 
 
 class TempikClient:
@@ -195,26 +221,87 @@ class TempikClient:
         data = self._request(f"/inboxes/{addr}/messages")
         return data if isinstance(data, list) else []
 
+    @staticmethod
+    def _received_at(msg: Dict[str, Any]) -> str:
+        return str(msg.get("received_at") or "").strip()
+
+    @classmethod
+    def newer_than(cls, messages: List[Dict[str, Any]], since: Optional[str]) -> List[Dict[str, Any]]:
+        """Keep only mails received at or after `since`.
+
+        Every request for a verification code invalidates the previous one, so
+        a mail that predates the latest request carries a dead code. Submitting
+        it produces "Verification code is invalid" and burns the whole round —
+        observed on a real run where the first code was read after the resend.
+
+        Mails with no usable timestamp are kept: they cannot be proven stale,
+        and dropping them would break a backend that omits the field.
+        """
+        if not since:
+            return list(messages)
+
+        fresh = []
+        for msg in messages:
+            ts = cls._received_at(msg)
+            if not ts or ts >= since:
+                fresh.append(msg)
+        return fresh
+
     async def wait_for_messages(
         self,
         address: str = None,
         max_wait: int = 150,
         interval: int = 5,
+        since: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Poll for messages until one arrives or timeout."""
-        addr = address or self._email
-        t0 = time.time()
+        """Poll until a mail newer than `since` arrives, or the window expires.
 
-        while time.time() - t0 < max_wait:
+        Returns the fresh mails, newest first. An empty list means "the inbox
+        really is empty", not "the network failed" — a window in which every
+        read failed is extended once, because the caller reacts to "no mail" by
+        triggering a resend that invalidates a code which may already be here.
+        """
+        addr = address or self._email
+        deadline = time.time() + max_wait
+        ok_reads = 0
+        extended = False
+        ignored = 0
+
+        while True:
+            if time.time() >= deadline:
+                if ok_reads == 0 and not extended:
+                    extended = True
+                    deadline = time.time() + min(max_wait, _UNREADABLE_GRACE)
+                    write_log(
+                        "Tempik inbox never became readable — extending the "
+                        f"wait by {min(max_wait, _UNREADABLE_GRACE)}s instead of "
+                        "reporting an empty inbox",
+                        "WARNING",
+                    )
+                    continue
+                break
+
             try:
                 messages = self.get_messages(addr)
-                if messages and len(messages) > 0:
-                    return messages
+                ok_reads += 1
+                fresh = self.newer_than(messages, since)
+                ignored = len(messages) - len(fresh)
+                if fresh:
+                    return sorted(
+                        fresh, key=self._received_at, reverse=True
+                    )
             except Exception as e:
                 write_log(f"Tempik poll error: {e}", "WARNING")
 
             await asyncio.sleep(interval)
 
+        if ignored:
+            write_log(
+                f"{ignored} mail(s) in {addr} were older than since={since} and "
+                "ignored — correct after a resend, but persistent occurrences "
+                "point at a local clock that is ahead of the server",
+                "WARNING",
+            )
         return []
 
     # ==================== OTP ====================
@@ -294,9 +381,10 @@ class TempikClient:
         address: str = None,
         max_wait: int = 150,
         interval: int = 5,
+        since: Optional[str] = None,
     ) -> Optional[str]:
         """Wait for OTP email and extract the code."""
-        messages = await self.wait_for_messages(address, max_wait, interval)
+        messages = await self.wait_for_messages(address, max_wait, interval, since)
         if messages:
             return self.extract_otp(messages)
         return None
