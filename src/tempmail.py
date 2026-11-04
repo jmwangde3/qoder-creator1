@@ -38,7 +38,11 @@ _FETCH_RETRIES = 3
 
 # Any single request can hit a TLS handshake timeout on a flaky uplink; one
 # lost handshake should not throw away an otherwise good account.
-_HTTP_RETRIES = 3
+#
+# 3 was not enough on a cold connection: a measured run lost two accounts in a
+# row because the line dropped for 75s and each attempt only covers ~12s. Five
+# attempts span roughly that window without slowing healthy requests at all.
+_HTTP_RETRIES = 5
 _RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
 
 # Per-request socket timeout. Healthy answers take ~0.3s; a dropped reply is
