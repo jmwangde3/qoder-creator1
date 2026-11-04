@@ -5,12 +5,64 @@ Local slider solver via image processing + mouse drag.
 Di-port dari arbilaksmana/qoder-autoreg (captcha-solver.js).
 Algoritma: alpha NCC + Canny edges + Sobel gap detection.
 """
+import json
 import random
 from typing import Optional, Dict, Any
 
 from rich.console import Console
 
 from .utils import write_log
+
+# How long to wait for the widget to render before deciding it is not coming.
+CONTAINER_TIMEOUT_MS = 6000
+WIDGET_TIMEOUT_MS = 12000
+
+# How many barren waits before giving up. Retrying an identical wait never
+# helps, so two is already generous.
+MAX_BARREN_WAITS = 2
+
+# The widget is usable only once both images decoded and the slider has width.
+READY_JS = (
+    "() => { const i=document.querySelector('#aliyunCaptcha-img');"
+    " const s=document.querySelector('#aliyunCaptcha-sliding-slider');"
+    " return !!(i&&i.complete&&i.naturalWidth>0&&s&&s.getBoundingClientRect().width>0); }"
+)
+
+# The captcha is optional: the flow may have advanced past this step.
+# Only the OTP inputs count — #basic_password belongs to the step *before*
+# the captcha, so testing for it would call a stuck page "advanced".
+ADVANCED_JS = "() => !!document.querySelector('input.ant-otp-input')"
+
+
+async def _flow_advanced(page) -> bool:
+    """True when the page already sits on a later step than the captcha."""
+    try:
+        return bool(await page.evaluate(ADVANCED_JS))
+    except Exception:
+        return False
+
+
+async def dump_widget_state(page) -> str:
+    """Which captcha/step elements exist right now — logged when things go wrong."""
+    try:
+        state = await page.evaluate(
+            """() => {
+                const q = s => !!document.querySelector(s);
+                return {
+                    url: location.href.slice(0, 100),
+                    img: q('#aliyunCaptcha-img'),
+                    puzzle: q('#aliyunCaptcha-puzzle'),
+                    slider: q('#aliyunCaptcha-sliding-slider'),
+                    body: q('#aliyunCaptcha-captcha-body'),
+                    wrapper: q('#aliyunCaptcha-captcha-wrapper'),
+                    otp: q('input.ant-otp-input'),
+                    pwd: q('#basic_password')
+                };
+            }"""
+        )
+        return json.dumps(state, ensure_ascii=False)
+    except Exception as e:
+        return f"<state dump failed: {e}>"
 
 
 # ==================== LOCAL SLIDER SOLVER JS ====================
@@ -109,11 +161,18 @@ async () => {
 
 
 async def solve_slider_local(page, max_attempts: int = 5, console: Console = None) -> bool:
-    """Solve slider Aliyun captcha locally via image processing + mouse drag.
+    """Solve the Aliyun slider captcha locally via image processing + drag.
 
-    Returns True jika captcha berhasil diselesaikan.
+    Returns True when the captcha is solved *or* was not required (the flow
+    already advanced). Returns False only when the widget should be there but
+    never became usable.
+
+    Note on the wait: the original code waited 15s per attempt and retried all
+    5 times even when the widget had not rendered at all — that burned 75s and
+    then reported "captcha failed" for a step that never needed solving.
     """
     c = console or Console()
+    barren_waits = 0
 
     for attempt in range(1, max_attempts + 1):
         c.print(f"    [dim]captcha attempt {attempt}/{max_attempts}[/]", end="")
@@ -126,13 +185,31 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
             except Exception:
                 pass
 
-            # Tunggu gambar dan slider siap
-            await page.wait_for_function(
-                "() => { const i=document.querySelector('#aliyunCaptcha-img');"
-                " const s=document.querySelector('#aliyunCaptcha-sliding-slider');"
-                " return i&&i.complete&&i.naturalWidth>0&&s&&s.getBoundingClientRect().width>0; }",
-                timeout=15000,
-            )
+            # Tahap 1: apakah widget-nya ada sama sekali?
+            try:
+                await page.wait_for_selector(
+                    "#aliyunCaptcha-img, #aliyunCaptcha-captcha-wrapper",
+                    timeout=CONTAINER_TIMEOUT_MS,
+                )
+            except Exception:
+                state = await dump_widget_state(page)
+
+                if await _flow_advanced(page):
+                    c.print(" [yellow]not required, flow already advanced[/]")
+                    write_log(f"Captcha absent, flow advanced: {state}", "INFO")
+                    return True
+
+                barren_waits += 1
+                c.print(f" [red]widget never rendered ({barren_waits}/{MAX_BARREN_WAITS})[/]")
+                write_log(f"Captcha widget missing: {state}", "WARNING")
+                if barren_waits >= MAX_BARREN_WAITS:
+                    c.print()
+                    write_log("Giving up on captcha after repeated empty waits", "ERROR")
+                    return False
+                continue
+
+            # Tahap 2: gambar sudah ter-decode dan slider punya lebar?
+            await page.wait_for_function(READY_JS, timeout=WIDGET_TIMEOUT_MS)
 
             # Jalankan solver JS di browser
             res = await page.evaluate(SOLVER_JS)

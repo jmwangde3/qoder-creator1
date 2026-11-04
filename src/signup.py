@@ -17,7 +17,7 @@ from .utils import write_log, generate_password, save_jsonl
 from .tempmail import TempikClient
 from .proxy import ProxyPool
 from .stealth import create_stealth_context, launch_stealth_browser
-from .captcha import solve_slider_local
+from .captcha import solve_slider_local, dump_widget_state
 from .pat import PATManager
 
 # Qoder's verification screen has no "resend" control. The only way to get a
@@ -138,7 +138,11 @@ class SignupManager:
                 c.print("  :puzzle_piece: Solving captcha...")
                 await self._click(page, [
                     "#aliyunCaptcha-captcha-body",
+                    "#aliyunCaptcha-captcha-left",
                     'button:has-text("Click to verify")',
+                    'text=Click to verify',
+                    'button:has-text("点击验证")',
+                    'button:has-text("点击此处验证")',
                 ])
                 await page.wait_for_timeout(3000)
 
@@ -146,6 +150,10 @@ class SignupManager:
                 if not solved:
                     c.print("  :x: [red]Captcha failed![/]")
                     write_log(f"[{idx}] Captcha failed for {email}", "ERROR")
+                    write_log(
+                        f"[{idx}] Captcha state: {await dump_widget_state(page)}",
+                        "ERROR",
+                    )
                     await context.close()
                     await browser.close()
                     return None
