@@ -285,7 +285,21 @@ class SignupManager:
 
                 if not accepted:
                     c.print("  :x: [red]No usable OTP — giving up![/]")
-                    write_log(f"[{idx}] OTP failed for {email}", "ERROR")
+                    # Distinguish "Qoder never sent anything" from "sent but the
+                    # code was unreadable": one means the account is lost to a
+                    # server-side drop, the other is our problem.
+                    try:
+                        seen = await asyncio.to_thread(tempmail.get_messages, email)
+                    except Exception:
+                        seen = []
+                    subjects = [str(m.get("subject", ""))[:40] for m in seen]
+                    write_log(
+                        f"[{idx}] OTP failed for {email}; inbox holds "
+                        f"{len(seen)} message(s)"
+                        + (f": {subjects}" if subjects else " — nothing was sent"),
+                        "ERROR",
+                    )
+                    await self._snapshot(page, f"{idx}_otp")
                     await context.close()
                     await browser.close()
                     return None
