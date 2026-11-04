@@ -124,15 +124,13 @@ class SignupManager:
 
                 # Step 5: Fill password
                 c.print("  :lock: Filling password...")
-                pw = await page.query_selector("#basic_password")
-                if pw:
-                    try:
-                        await pw.click(force=True)
-                        await page.keyboard.type(password, delay=20)
-                    except Exception:
-                        pass
-                await self._click(page, ['button:has-text("Continue")'])
-                await page.wait_for_timeout(4000)
+                if not await self._fill_password_step(page, password, idx):
+                    c.print("  :x: [red]Password step would not advance![/]")
+                    write_log(f"[{idx}] Password step stuck for {email}", "ERROR")
+                    await self._snapshot(page, f"{idx}_password")
+                    await context.close()
+                    await browser.close()
+                    return None
 
                 # Step 6: Solve captcha
                 c.print("  :puzzle_piece: Solving captcha...")
@@ -154,6 +152,11 @@ class SignupManager:
                         f"[{idx}] Captcha state: {await dump_widget_state(page)}",
                         "ERROR",
                     )
+                    write_log(
+                        f"[{idx}] Visible buttons: {await self._page_buttons(page)}",
+                        "ERROR",
+                    )
+                    await self._snapshot(page, f"{idx}_captcha")
                     await context.close()
                     await browser.close()
                     return None
@@ -281,16 +284,9 @@ class SignupManager:
             write_log("Back did not lead to the password step", "WARNING")
             return False
 
-        pw = await page.query_selector("#basic_password")
-        if pw:
-            try:
-                await pw.click(force=True)
-                await page.keyboard.type(password, delay=20)
-            except Exception:
-                pass
-
-        await self._click(page, ['button:has-text("Continue")'])
-        await page.wait_for_timeout(4000)
+        if not await self._fill_password_step(page, password):
+            write_log("Resend: password step would not advance", "WARNING")
+            return False
 
         await self._click(page, [
             "#aliyunCaptcha-captcha-body",
@@ -299,6 +295,96 @@ class SignupManager:
         await page.wait_for_timeout(3000)
 
         return await solve_slider_local(page, max_attempts=5, console=self.console)
+
+    async def _fill_password_step(self, page: Page, password: str, idx: int = 0) -> bool:
+        """Fill the password field and confirm the step actually advanced.
+
+        Observed failure: the Continue click never registered, the page stayed
+        on /users/sign-up with #basic_password still mounted, and everything
+        after it (captcha, OTP) waited for elements that could never appear.
+        Checking here turns that into one clear error instead of a bogus
+        captcha failure 80 seconds later.
+        """
+        for attempt in (1, 2):
+            if not await page.query_selector("#basic_password"):
+                return True  # already past this step
+
+            filled = False
+            try:
+                await page.fill("#basic_password", password)
+                filled = True
+            except Exception:
+                pass
+            if not filled:
+                try:
+                    await page.click("#basic_password", force=True)
+                    await page.keyboard.type(password, delay=20)
+                except Exception:
+                    pass
+
+            clicked = await self._click(page, [
+                'button:has-text("Continue")',
+                'button:has-text("继续")',
+                'button[type="submit"]',
+            ])
+            await page.wait_for_timeout(3500)
+
+            if not await page.query_selector("#basic_password"):
+                return True
+
+            write_log(
+                f"[{idx}] Password step stuck after {clicked or 'no click'} "
+                f"(attempt {attempt}); buttons={await self._page_buttons(page)}",
+                "WARNING",
+            )
+
+            # Last resort: some forms submit on Enter.
+            try:
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(2500)
+            except Exception:
+                pass
+            if not await page.query_selector("#basic_password"):
+                return True
+
+        return False
+
+    @staticmethod
+    async def _page_buttons(page: Page) -> list:
+        """Visible button labels — logged when a step refuses to advance.
+
+        Disabled controls are marked, because a greyed-out Continue is the
+        usual reason a click does nothing.
+        """
+        try:
+            return await page.evaluate(
+                """() => Array.from(
+                        document.querySelectorAll('button, [role=button], a'))
+                    .filter(e => e.offsetParent !== null)
+                    .map(e => {
+                        const t = (e.innerText || e.getAttribute('aria-label') || '')
+                            .trim().replace(/\\s+/g, ' ').slice(0, 40);
+                        const off = e.disabled
+                            || e.getAttribute('aria-disabled') === 'true'
+                            || e.classList.contains('disabled')
+                            || e.classList.contains('ant-btn-disabled');
+                        return t ? (off ? t + ' [disabled]' : t) : '';
+                    })
+                    .filter(t => t)
+                    .slice(0, 15)"""
+            )
+        except Exception:
+            return []
+
+    @staticmethod
+    async def _snapshot(page: Page, tag: str) -> None:
+        """Save a screenshot of the stuck page next to the results file."""
+        try:
+            path = ACCOUNTS_FILE.parent / f"failure_{tag}.png"
+            await page.screenshot(path=str(path))
+            write_log(f"Screenshot saved: {path}", "INFO")
+        except Exception as e:
+            write_log(f"Screenshot failed: {e}", "WARNING")
 
     @staticmethod
     async def _click(page: Page, selectors: list) -> Optional[str]:
