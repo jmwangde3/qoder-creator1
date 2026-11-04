@@ -44,14 +44,29 @@ PUZZLE_X_JS = r"""
 () => {
   const p = document.querySelector('#aliyunCaptcha-puzzle');
   if (!p) return null;
-  const left = parseFloat(p.style.left);
-  if (Number.isFinite(left)) return left;
+
+  // The widget usually parks `left: 0` in the inline style and animates the
+  // real offset through a transform. Reading `left` first would return that
+  // stale 0 and every correction would believe the piece never moved, so the
+  // transform wins whenever it carries a non-zero displacement.
   const t = getComputedStyle(p).transform;
-  const m = /matrix\(([^)]+)\)/.exec(t || '');
+  let m = /matrix3d\(([^)]+)\)/.exec(t || '');
   if (m) {
     const v = m[1].split(',').map(Number);
-    if (v.length === 6 && Number.isFinite(v[4])) return v[4];
+    if (v.length === 16 && Number.isFinite(v[12]) && Math.abs(v[12]) > 0.01) {
+      return v[12];
+    }
   }
+  m = /matrix\(([^)]+)\)/.exec(t || '');
+  if (m) {
+    const v = m[1].split(',').map(Number);
+    if (v.length === 6 && Number.isFinite(v[4]) && Math.abs(v[4]) > 0.01) {
+      return v[4];
+    }
+  }
+
+  const left = parseFloat(p.style.left);
+  if (Number.isFinite(left)) return left;
   return null;
 }
 """
@@ -152,22 +167,49 @@ async () => {
   const bgG=new Float64Array(bg.w*bg.h);
   for (let i=0;i<bg.w*bg.h;i++) bgG[i]=bg.d[i*4]*0.299+bg.d[i*4+1]*0.587+bg.d[i*4+2]*0.114;
 
+  // Erode the mask by one pixel. A real piece's outermost ring is
+  // alpha-blended, and the hole's rim still shows the untouched photo, so
+  // those pixels disagree by construction and pull the correlation toward a
+  // decoy one piece-width away. Dropping the ring costs ~12% of the samples
+  // and removes that failure mode entirely.
+  const pzE=new Uint8Array(cw*ch);
+  let validN=0;
+  for (let y=0;y<ch;y++) for (let x=0;x<cw;x++) {
+    const i=y*cw+x;
+    if(!pzM[i]||x===0||y===0||x===cw-1||y===ch-1) continue;
+    let solid=1;
+    for(let dy=-1;dy<=1&&solid;dy++) for(let dx=-1;dx<=1;dx++) {
+      if(!pzM[i+dy*cw+dx]){solid=0;break;}
+    }
+    if(solid){pzE[i]=1;validN++;}
+  }
+  if (validN<64) return {targetX:-1, error:'degenerate-mask'};
+
   function blur(data,w,h){const o=new Float64Array(w*h);
-    for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++)o[y*w+x]=(
-      data[(y-1)*w+(x-1)]+2*data[(y-1)*w+x]+data[(y-1)*w+(x+1)]+
-      2*data[y*w+(x-1)]+4*data[y*w+x]+2*data[y*w+(x+1)]+
-      data[(y+1)*w+(x-1)]+2*data[(y+1)*w+x]+data[(y+1)*w+(x+1)])/16;
+    // Edge-replicating. The greedy alpha bbox means the outer ring of `data`
+    // IS the silhouette the mask selects; letting it decay to zero would
+    // replace the strongest evidence with near-black.
+    for(let y=0;y<h;y++){const ym=y>0?y-1:0,yp=y<h-1?y+1:h-1;
+      for(let x=0;x<w;x++){const xm=x>0?x-1:0,xp=x<w-1?x+1:w-1;
+        o[y*w+x]=(
+          data[ym*w+xm]+2*data[ym*w+x]+data[ym*w+xp]+
+          2*data[y*w+xm]+4*data[y*w+x]+2*data[y*w+xp]+
+          data[yp*w+xm]+2*data[yp*w+x]+data[yp*w+xp])/16;}}
     return o;}
   const bgB=blur(bgG,bg.w,bg.h), pzB=blur(pzG,cw,ch);
 
   function ncc(src,sw,sh,tpl,tw,th,mask,maskN,offY){
     let bx=-1,by=-1,bs=-2;
     const y0=Math.max(0,offY-10), y1=Math.min(sh-th,offY+10);
+    // maskN counts opaque pixels; the mask spans tw*th slots and the opaque
+    // ones are scattered through it, so the scan must cover the whole array.
+    // Stopping at maskN drops the piece's lower rows and skews both means.
+    const span=mask.length;
     for(let ox=1;ox<=sw-tw-1;ox++)for(let oy=y0;oy<=y1;oy++){
-      let tm=0,sm=0;for(let i=0;i<maskN;i++){if(!mask[i])continue;
+      let tm=0,sm=0;for(let i=0;i<span;i++){if(!mask[i])continue;
         const tx=i%tw,ty=(i/tw)|0;tm+=tpl[i];sm+=src[(oy+ty)*sw+(ox+tx)];}
       tm/=maskN;sm/=maskN;let tv=0,sv=0,cv=0;
-      for(let i=0;i<maskN;i++){if(!mask[i])continue;
+      for(let i=0;i<span;i++){if(!mask[i])continue;
         const tx=i%tw,ty=(i/tw)|0,td=tpl[i]-tm,sd=src[(oy+ty)*sw+(ox+tx)]-sm;
         tv+=td*td;sv+=sd*sd;cv+=sd*td;}
       tv/=maskN;sv/=maskN;const ts=Math.sqrt(tv),ss=Math.sqrt(sv);
@@ -175,7 +217,7 @@ async () => {
       if(n>bs){bs=n;bx=ox;by=oy;}}
     return {bx,by,bs};}
 
-  const nccR=ncc(bgB,bg.w,bg.h,pzB,cw,ch,pzM,maskN,pzMinY);
+  const nccR=ncc(bgB,bg.w,bg.h,pzB,cw,ch,pzE,validN,pzMinY);
   let targetX = nccR.bx;
   // fallback: gap via column edge sum (Sobel X)
   if (targetX<=15) {
