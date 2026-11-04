@@ -6,7 +6,9 @@ Di-port dari arbilaksmana/qoder-autoreg (captcha-solver.js).
 Algoritma: alpha NCC + Canny edges + Sobel gap detection.
 """
 import json
+import pathlib
 import random
+import time
 from typing import Optional, Dict, Any
 
 from rich.console import Console
@@ -20,6 +22,13 @@ WIDGET_TIMEOUT_MS = 12000
 # How many barren waits before giving up. Retrying an identical wait never
 # helps, so two is already generous.
 MAX_BARREN_WAITS = 2
+
+# The piece animates after each mouse move. Reading immediately samples a
+# mid-flight transform and makes a 1:1 handle look like it has a 0.16 gain.
+SETTLE_TRIES = 5
+SETTLE_GAP_MS = 25
+MAX_DRAG_STEPS = 60
+MAX_STEP_PX = 90.0
 
 # The widget is usable only once both images decoded and the slider has width.
 READY_JS = (
@@ -47,27 +56,29 @@ PUZZLE_X_JS = r"""
 
   // The widget usually parks `left: 0` in the inline style and animates the
   // real offset through a transform. Reading `left` first would return that
-  // stale 0 and every correction would believe the piece never moved, so the
-  // transform wins whenever it carries a non-zero displacement.
+  // stale 0 and every correction would believe the piece never moved, so a
+  // non-zero transform wins. A zero transform is still a valid reading though:
+  // the piece sits at the start and `left` is an empty string, which must not
+  // collapse into "cannot read".
   const t = getComputedStyle(p).transform;
+  let moved = null;
   let m = /matrix3d\(([^)]+)\)/.exec(t || '');
   if (m) {
     const v = m[1].split(',').map(Number);
-    if (v.length === 16 && Number.isFinite(v[12]) && Math.abs(v[12]) > 0.01) {
-      return v[12];
+    if (v.length === 16 && Number.isFinite(v[12])) moved = v[12];
+  } else {
+    m = /matrix\(([^)]+)\)/.exec(t || '');
+    if (m) {
+      const v = m[1].split(',').map(Number);
+      if (v.length === 6 && Number.isFinite(v[4])) moved = v[4];
     }
   }
-  m = /matrix\(([^)]+)\)/.exec(t || '');
-  if (m) {
-    const v = m[1].split(',').map(Number);
-    if (v.length === 6 && Number.isFinite(v[4]) && Math.abs(v[4]) > 0.01) {
-      return v[4];
-    }
-  }
+  if (moved !== null && Math.abs(moved) > 0.01) return moved;
 
   const left = parseFloat(p.style.left);
   if (Number.isFinite(left)) return left;
-  return null;
+
+  return moved;
 }
 """
 
@@ -89,6 +100,67 @@ def _mouse_delta(target: float, observed: float, gain: float) -> float:
     widget cannot silently break the drag.
     """
     return (target - observed) / max(gain, 0.2)
+
+
+async def _settled_x(page) -> Optional[float]:
+    """Puzzle offset once the widget stops animating it."""
+    last = None
+    for _ in range(SETTLE_TRIES):
+        value = await _puzzle_x(page)
+        if value is not None:
+            if last is not None and abs(value - last) <= 0.5:
+                return value
+            last = value
+        await page.wait_for_timeout(SETTLE_GAP_MS)
+    return last
+
+
+DUMP_JS = r"""
+() => {
+  const pick = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return {
+      id: el.id || null,
+      tag: el.tagName,
+      rect: {x:r.x, y:r.y, w:r.width, h:r.height},
+      inlineLeft: el.style.left || null,
+      inlineTransform: el.style.transform || null,
+      computedTransform: cs.transform,
+      position: cs.position,
+      width: cs.width,
+      parent: el.parentElement
+        ? (el.parentElement.id || el.parentElement.tagName) : null
+    };
+  };
+  const nodes = {};
+  document.querySelectorAll('[id^="aliyunCaptcha"]').forEach((el) => {
+    nodes[el.id] = pick(el);
+  });
+  const img = document.querySelector('#aliyunCaptcha-img');
+  return {
+    nodes,
+    view: {w: window.innerWidth, h: window.innerHeight},
+    imgNatural: img ? {w: img.naturalWidth, h: img.naturalHeight} : null
+  };
+}
+"""
+
+
+async def _dump_dom(page, tag: str) -> Optional[str]:
+    """Persist the widget's real geometry so a mismatch can be inspected."""
+    try:
+        payload = await page.evaluate(DUMP_JS)
+        out = pathlib.Path("data")
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"captcha_dom_{int(time.time())}_{tag}.json"
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return str(path)
+    except Exception:
+        return None
 
 
 async def _flow_advanced(page) -> bool:
@@ -238,7 +310,7 @@ async () => {
     targetX, score:nccR.bs, method: targetX<=15?'gap-fallback':'gray-ncc',
     displayLeft: displayLeft<10?10:displayLeft,
     sliderX:sRect.x, sliderY:sRect.y, sliderW:sRect.width, sliderH:sRect.height,
-    bgDisplayW: bgRect.width, bgNaturalW: bg.w
+    bgDisplayW: bgRect.width, bgNaturalW: bg.w, viewW: window.innerWidth
   };
 }
 """
@@ -318,43 +390,105 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
             # mouse 1:1, so the first move used to be wrong for no reason: it
             # multiplied by (dl / (bgW - 52)) and then by the *handle* width.
             # A 24px probe measures the real gain instead of assuming it.
-            start_x = await _puzzle_x(page)
             probe = 24.0
+            start_x = await _settled_x(page)
             await page.mouse.move(sx + probe, sy, steps=6)
+            observed = await _settled_x(page)
 
-            gain = 1.0
-            observed = await _puzzle_x(page)
-            if start_x is not None and observed is not None:
-                measured = (observed - start_x) / probe
-                if measured <= 0.02:
-                    # The handle never took the drag. Release instead of
-                    # spending the remaining corrections pushing a dead slider.
-                    await page.mouse.up()
-                    write_log("Captcha: puzzle did not follow the probe, retrying", "WARNING")
-                    await page.wait_for_timeout(1200)
-                    continue
-                gain = measured
+            if start_x is None or observed is None or observed - start_x < 1.0:
+                # The handle never took the drag. Release instead of spending
+                # the remaining corrections pushing a dead slider.
+                await page.mouse.up()
+                dumped = await _dump_dom(page, "no_follow")
+                write_log("Captcha: puzzle did not follow the probe, retrying", "WARNING")
+                if dumped:
+                    write_log("Captcha: widget geometry saved to %s" % dumped, "INFO")
+                await page.wait_for_timeout(1200)
+                continue
 
-            # Unreadable position: assume the probe moved the piece by its own
-            # length, which is what a 1:1 widget does.
-            here = observed if observed is not None else probe
-            cx = sx + probe + _mouse_delta(dl, here, gain)
-            cx = min(cx, sx + res["bgDisplayW"])
-            await page.mouse.move(cx, sy, steps=12)
-            await page.wait_for_timeout(120)
+            measured = (observed - start_x) / probe
+            if measured < 0.5:
+                # A mid-flight sample reads far too small. Give the widget time
+                # to finish the transition before believing the ratio.
+                await page.wait_for_timeout(300)
+                again = await _settled_x(page)
+                if again is not None and again > observed:
+                    observed = again
+                    measured = (observed - start_x) / probe
+                    write_log(
+                        "Captcha: probe gain %.2f after settling" % measured, "INFO"
+                    )
 
-            # Fine-tune against what the widget reports (tolerance ~1.5px).
-            final = None
-            for _ in range(8):
+            gain = measured
+            if not 0.5 <= gain <= 2.0:
+                write_log(
+                    "Captcha: probe gain %.2f is unusual, using bounded steps" % gain,
+                    "WARNING",
+                )
+
+            # Refuse a drag that cannot physically finish.
+            needed = probe + dl / max(gain, 0.05)
+            if needed > 1600.0:
+                await page.mouse.up()
+                write_log(
+                    "Captcha: needs %.0fpx of cursor travel, skipping" % needed,
+                    "WARNING",
+                )
+                await page.wait_for_timeout(1200)
+                continue
+
+            # Close the loop instead of trusting one computed offset. This
+            # survives an unknown gain, a clamped track and a widget that only
+            # reports 0 or its far end. The travel estimate only seeds the
+            # limit, so leave it slack.
+            view_w = float(res.get("viewW") or 0) or 1600.0
+            cx = sx + probe
+            limit = min(sx + needed * 1.5 + 80.0, view_w - 8.0)
+            final = observed
+            stalled = 0
+            for _ in range(MAX_DRAG_STEPS):
+                error = dl - final
+                if abs(error) <= 1.0:
+                    break
+                travel = _mouse_delta(dl, final, gain)
+                travel = max(-MAX_STEP_PX, min(MAX_STEP_PX, travel))
+                next_x = min(cx + travel, limit)
+                if abs(next_x - cx) < 0.5:
+                    dumped = await _dump_dom(page, "edge")
+                    write_log(
+                        "Captcha: cursor reached the window edge at %.1f/%.1f"
+                        % (final, dl),
+                        "WARNING",
+                    )
+                    if dumped:
+                        write_log(
+                            "Captcha: widget geometry saved to %s" % dumped, "INFO"
+                        )
+                    break
+                cx = next_x
+                await page.mouse.move(cx, sy + (random.random() - 0.5) * 1.5, steps=3)
+                await page.wait_for_timeout(30)
                 cur = await _puzzle_x(page)
                 if cur is None:
                     break
+                if abs(cur - final) < 0.05:
+                    stalled += 1
+                    if stalled >= 5:
+                        dumped = await _dump_dom(page, "stalled")
+                        write_log(
+                            "Captcha: piece stopped responding at %.1f/%.1f"
+                            % (final, dl),
+                            "WARNING",
+                        )
+                        if dumped:
+                            write_log(
+                                "Captcha: widget geometry saved to %s" % dumped,
+                                "INFO",
+                            )
+                        break
+                else:
+                    stalled = 0
                 final = cur
-                if abs(cur - dl) <= 1.5:
-                    break
-                cx += _mouse_delta(dl, cur, gain)
-                await page.mouse.move(cx, sy + (random.random() - 0.5) * 1.5, steps=4)
-                await page.wait_for_timeout(20)
 
             await page.mouse.up()
             write_log(
