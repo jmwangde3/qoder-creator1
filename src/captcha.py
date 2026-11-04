@@ -27,8 +27,6 @@ MAX_BARREN_WAITS = 2
 # mid-flight transform and makes a 1:1 handle look like it has a 0.16 gain.
 SETTLE_TRIES = 5
 SETTLE_GAP_MS = 25
-MAX_DRAG_STEPS = 30
-MAX_STEP_PX = 90.0
 
 # The widget is usable only once both images decoded and the slider has width.
 READY_JS = (
@@ -54,31 +52,45 @@ PUZZLE_X_JS = r"""
   const p = document.querySelector('#aliyunCaptcha-puzzle');
   if (!p) return null;
 
-  // The widget usually parks `left: 0` in the inline style and animates the
-  // real offset through a transform. Reading `left` first would return that
-  // stale 0 and every correction would believe the piece never moved, so a
-  // non-zero transform wins. A zero transform is still a valid reading though:
-  // the piece sits at the start and `left` is an empty string, which must not
-  // collapse into "cannot read".
-  const t = getComputedStyle(p).transform;
-  let moved = null;
-  let m = /matrix3d\(([^)]+)\)/.exec(t || '');
-  if (m) {
-    const v = m[1].split(',').map(Number);
-    if (v.length === 16 && Number.isFinite(v[12])) moved = v[12];
-  } else {
-    m = /matrix\(([^)]+)\)/.exec(t || '');
+  // Read the *target* offset, not the rendered one. getComputedStyle()
+  // returns the interpolated transform while the widget's CSS transition is
+  // still running, so a mid-drag read reports the piece further behind than
+  // it will end up, and dividing by that ratio oversizes every correction.
+  // The inline style is what the widget set for this pointer position.
+  const parse = (text) => {
+    if (!text) return null;
+    let m = /matrix3d\(([^)]+)\)/.exec(text);
     if (m) {
       const v = m[1].split(',').map(Number);
-      if (v.length === 6 && Number.isFinite(v[4])) moved = v[4];
+      if (v.length === 16 && Number.isFinite(v[12])) return v[12];
     }
-  }
-  if (moved !== null && Math.abs(moved) > 0.01) return moved;
+    m = /matrix\(([^)]+)\)/.exec(text);
+    if (m) {
+      const v = m[1].split(',').map(Number);
+      if (v.length === 6 && Number.isFinite(v[4])) return v[4];
+    }
+    m = /translateX\(\s*(-?[0-9.]+)px/i.exec(text);
+    if (m) return parseFloat(m[1]);
+    m = /translate3d\(\s*(-?[0-9.]+)px/i.exec(text);
+    if (m) return parseFloat(m[1]);
+    m = /translate\(\s*(-?[0-9.]+)px/i.exec(text);
+    if (m) return parseFloat(m[1]);
+    return null;
+  };
 
-  const left = parseFloat(p.style.left);
-  if (Number.isFinite(left)) return left;
+  const inlineTf = parse(p.style.transform);
+  const inlineLeft = parseFloat(p.style.left);
+  const hasLeft = Number.isFinite(inlineLeft);
 
-  return moved;
+  // `left` is often the stale 0 the widget parks there while it animates the
+  // transform, so the transform wins only when it actually moved. A zero on
+  // both is still a valid reading: the piece sits at the start.
+  if (inlineTf !== null && Math.abs(inlineTf) > 0.01) return inlineTf;
+  if (hasLeft && Math.abs(inlineLeft) > 0.01) return inlineLeft;
+  if (inlineTf !== null) return inlineTf;
+  if (hasLeft) return inlineLeft;
+
+  return parse(getComputedStyle(p).transform);
 }
 """
 
@@ -163,6 +175,23 @@ async def _dump_dom(page, tag: str) -> Optional[str]:
         return str(path)
     except Exception:
         return None
+
+
+async def _smooth_move(
+    page, from_x: float, to_x: float, y: float, segments: int = 12, gap_ms: int = 18
+) -> None:
+    """Drag along one continuous, eased arc instead of move-read-move-read.
+
+    The widget grades the trajectory, not only the endpoint: evenly spaced
+    moves separated by fixed pauses read as a robot, which is why a drag that
+    landed within 1px was still rejected.
+    """
+    for index in range(1, segments + 1):
+        fraction = index / segments
+        eased = 1.0 - (1.0 - fraction) ** 2
+        x = from_x + (to_x - from_x) * eased
+        await page.mouse.move(x, y + (random.random() - 0.5) * 1.4, steps=2)
+        await page.wait_for_timeout(gap_ms)
 
 
 async def _flow_advanced(page) -> bool:
@@ -442,62 +471,51 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                     "INFO",
                 )
 
-            # Close the loop instead of trusting one computed offset. The
-            # travel estimate only seeds the limit: a gain measured too small
-            # overstates the travel and must not veto the attempt.
+            # One continuous drag to the computed cursor position, then at
+            # most a couple of short corrections. Reading between every step
+            # produced an evenly spaced move-pause pattern that landed within
+            # 1px and was still rejected as automated input.
             view_w = float(res.get("viewW") or 0) or 1600.0
+            headroom = view_w - 8.0
             cx = sx + travelled
-            limit = min(cx + (dl / max(gain, 0.05)) * 1.2 + 120.0, view_w - 8.0)
             final = observed
-            stalled = 0
-            for _ in range(MAX_DRAG_STEPS):
+
+            target_cx = min(cx + _mouse_delta(dl, final, gain), headroom)
+            distance = abs(target_cx - cx)
+            segments = max(6, min(18, int(distance / 18) or 6))
+            await _smooth_move(page, cx, target_cx, sy, segments)
+            cx = target_cx
+            settled = await _settled_x(page, tries=8, gap_ms=30)
+            if settled is not None:
+                final = settled
+
+            for _ in range(3):
                 error = dl - final
-                if abs(error) <= 1.0:
+                if abs(error) <= 1.5:
                     break
-                travel = _mouse_delta(dl, final, gain)
-                travel = max(-MAX_STEP_PX, min(MAX_STEP_PX, travel))
-                next_x = min(cx + travel, limit)
-                if abs(next_x - cx) < 0.5:
+                next_cx = min(cx + _mouse_delta(dl, final, gain), headroom)
+                moved_cursor = next_cx - cx
+                if abs(moved_cursor) < 1.0:
                     dumped = await _dump_dom(page, "edge")
                     write_log(
-                        "Captcha: cursor reached the window edge at %.1f/%.1f"
+                        "Captcha: cursor reached its limit at %.1f/%.1f"
                         % (final, dl),
                         "WARNING",
                     )
                     if dumped:
                         write_log("Captcha: widget geometry saved to %s" % dumped, "INFO")
                     break
-                previous_x, cx = cx, next_x
-                await page.mouse.move(cx, sy + (random.random() - 0.5) * 1.5, steps=3)
-                # Settle before reading, or the loop keeps believing the piece
-                # is behind and drives the cursor into the limit.
-                cur = await _settled_x(page, tries=4, gap_ms=30)
-                if cur is None:
+                previous = final
+                await _smooth_move(page, cx, next_cx, sy, segments=4, gap_ms=14)
+                cx = next_cx
+                settled = await _settled_x(page, tries=6, gap_ms=30)
+                if settled is None:
                     break
-                moved_cursor = cx - previous_x
-                moved_piece = cur - final
-                if abs(moved_cursor) >= 8.0 and abs(moved_piece) >= 1.0:
-                    refined = moved_piece / moved_cursor
+                final = settled
+                if abs(moved_cursor) >= 8.0 and abs(final - previous) >= 1.0:
+                    refined = (final - previous) / moved_cursor
                     if 0.02 <= refined <= 3.0:
                         gain = refined
-                if abs(cur - final) < 0.05:
-                    stalled += 1
-                    if stalled >= 5:
-                        dumped = await _dump_dom(page, "stalled")
-                        write_log(
-                            "Captcha: piece stopped responding at %.1f/%.1f"
-                            % (final, dl),
-                            "WARNING",
-                        )
-                        if dumped:
-                            write_log(
-                                "Captcha: widget geometry saved to %s" % dumped,
-                                "INFO",
-                            )
-                        break
-                else:
-                    stalled = 0
-                final = cur
 
             await page.mouse.up()
             write_log(
