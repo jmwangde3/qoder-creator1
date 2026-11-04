@@ -48,6 +48,20 @@ class ExtractOtpTest(unittest.TestCase):
         noise = mail("promo@shop.com", "Promo", "coupon 445566 and 778899")
         self.assertEqual(self.c.extract_otp([noise, real_qoder_mail()]), QLD_CODE)
 
+    def test_newer_welcome_mail_does_not_shadow_the_code(self):
+        """Qoder's welcome mail arrives after the OTP and is also from
+        no-reply@qoder.com — it must not win just by being newer."""
+        welcome = mail(
+            "no-reply@qoder.com",
+            "Welcome to Qoder! Here's Your Free Pro Trial & 300 Credits",
+            "<html><body><p>Hi, welcome. A 2-week Pro trial and 300 Credits "
+            "await you.</p></body></html>",
+        )
+        # newest first, which is the order tempik returns
+        self.assertEqual(
+            self.c.extract_otp([welcome, real_qoder_mail()]), QLD_CODE
+        )
+
     def test_no_guess_from_invoice(self):
         """A lone order number is not a verification code."""
         noise = mail("billing@shop.com", "Your invoice", "Order 202611 total 899.00")
