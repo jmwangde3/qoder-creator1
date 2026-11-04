@@ -28,8 +28,18 @@ OTP_WAIT_SECONDS = 60
 OTP_ROUNDS = 3  # initial send + 2 re-sends
 
 # How long the OTP screen may take to accept or reject a code. It auto-submits
-# once the sixth digit is typed, so the verdict usually lands within a second.
+# once the sixth digit is typed, but the account is only marked verified a
+# moment later: a real run asked for a PAT 0.7s after typing, got 401, and the
+# welcome mail landed three seconds after that.
 OTP_RESULT_SECONDS = 20
+
+# Only a page the flow actually lands on after verifying counts as success.
+OTP_SUCCESS_URL_HINTS = ("download", "dashboard", "welcome", "onboarding")
+
+# The session can lag behind the verification by a few seconds, so a 401 from
+# the PAT endpoint is retried rather than treated as final.
+PAT_ATTEMPTS = 4
+PAT_RETRY_SECONDS = 4
 
 # Wording the verification screen uses when the code is wrong. A rejected code
 # means the account is not verified, and creating a PAT then answers 401 while
@@ -228,8 +238,8 @@ class SignupManager:
                         else:
                             if outcome == "unknown":
                                 write_log(
-                                    f"[{idx}] OTP outcome unknown — the page neither "
-                                    "advanced nor showed an error",
+                                    f"[{idx}] OTP outcome unknown — page neither "
+                                    f"advanced nor showed an error (url={page.url})",
                                     "WARNING",
                                 )
                             accepted = True
@@ -264,11 +274,26 @@ class SignupManager:
                 else:
                     c.print("  :warning: [yellow]Account may be pending...[/]")
 
-                # Step 9: Create PAT. An unverified session answers 401, and
-                # that used to be written out as a successful account with an
-                # empty token, so it is now a hard failure.
+                # Step 9: Create PAT. The session is marked verified a moment
+                # after the code is accepted, so a 401 here usually means "not
+                # yet" rather than "never" — retry it briefly.
                 c.print("  :shield: Creating PAT...")
-                pat_response = await PATManager.create(page, "farm")
+                await page.wait_for_timeout(1200)
+
+                pat_response: Dict[str, Any] = {}
+                for attempt in range(1, PAT_ATTEMPTS + 1):
+                    pat_response = await PATManager.create(page, "farm")
+                    if PATManager.is_valid(pat_response):
+                        break
+                    if pat_response.get("status") != 401 or attempt == PAT_ATTEMPTS:
+                        break
+                    write_log(
+                        f"[{idx}] PAT answered 401 (attempt {attempt}/"
+                        f"{PAT_ATTEMPTS}) — session not verified yet, retrying",
+                        "WARNING",
+                    )
+                    await page.wait_for_timeout(PAT_RETRY_SECONDS * 1000)
+
                 pat_token = PATManager.extract_token(pat_response)
                 pat_valid = PATManager.is_valid(pat_response)
 
@@ -393,19 +418,32 @@ class SignupManager:
         return outcome
 
     async def _otp_outcome(self, page: Page, timeout: float = OTP_RESULT_SECONDS) -> str:
-        """Watch the verification screen: "ok", "rejected" or "unknown"."""
+        """Watch the verification screen: "ok", "rejected" or "unknown".
+
+        Success means the flow reached a page it only reaches after verifying.
+        An earlier version also accepted "the URL is not the signup route",
+        which fired on the very first poll of the live page — before the code
+        had even been submitted — and sent the run to the PAT endpoint while
+        the session was still anonymous.
+        """
+        start_url = page.url
         deadline = time.time() + timeout
+
         while True:
             try:
-                if not any(
-                    k in page.url for k in ("sign-up", "signup", "verify")
-                ):
+                url = page.url
+                if any(hint in url.lower() for hint in OTP_SUCCESS_URL_HINTS):
                     return "ok"
-                if not await page.query_selector("input.ant-otp-input"):
-                    return "ok"
+
                 text = ((await page.inner_text("body")) or "").lower()
                 if any(hint in text for hint in OTP_ERROR_HINTS):
                     return "rejected"
+
+                # Moved somewhere else entirely and the code boxes are gone.
+                if url != start_url and not await page.query_selector(
+                    "input.ant-otp-input"
+                ):
+                    return "ok"
             except Exception:
                 pass
 
