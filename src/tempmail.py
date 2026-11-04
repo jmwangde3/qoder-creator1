@@ -36,6 +36,23 @@ _FETCH_RETRIES = 3
 _HTTP_RETRIES = 3
 _RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
 
+# Text that introduces a verification code. Qoder's mail is localised, so the
+# English-only phrases the original regex looked for never show up — match the
+# Chinese wording too.
+_CODE_PREFIX = (
+    r"(?:验证码|校验码|验证代码|动态码|动态密码|"
+    r"verification\s*code|verify\s*code|security\s*code|login\s*code|"
+    r"one[-\s]?time\s*(?:code|password)|passcode|otp)"
+)
+
+# A mail only counts as an OTP candidate when the sender or the text says so.
+# Anything else must not donate a random 6-digit number as the code.
+_OTP_SENDER_HINTS = ("qoder.com",)
+_OTP_TEXT_HINTS = (
+    "qoder", "验证码", "verification code", "verify your email",
+    "otp", "passcode", "one-time",
+)
+
 
 class TempikClient:
     """Tempik disposable email API client."""
@@ -201,44 +218,75 @@ class TempikClient:
         return []
 
     # ==================== OTP ====================
-    def extract_otp(self, messages: List[Dict[str, Any]]) -> Optional[str]:
-        """Extract verification code from messages.
+    @staticmethod
+    def _plain(msg: Dict[str, Any]) -> str:
+        """Subject + body with tags and runs of whitespace collapsed."""
+        body = msg.get("body", "") or msg.get("text", "") or ""
+        subject = msg.get("subject", "") or ""
+        plain = re.sub(r"<[^>]+>", " ", body)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        return f"{subject} {plain}".strip()
 
-        Qoder sends HTML email with the code as a standalone 6-digit number
-        after "Verify your email" text. We strip HTML tags first, then search
-        for the code in the plain text.
+    @staticmethod
+    def _looks_like_otp(msg: Dict[str, Any], text: str) -> bool:
+        sender = (msg.get("from_address") or "").lower()
+        if any(h in sender for h in _OTP_SENDER_HINTS):
+            return True
+        low = text.lower()
+        return any(h in low for h in _OTP_TEXT_HINTS)
+
+    @staticmethod
+    def _code_after_keyword(text: str) -> Optional[str]:
+        """Dig out a code that directly follows a verification-code phrase.
+
+        Bounded to 60 non-digit characters so the match cannot jump across
+        an unrelated number further down the mail.
         """
-        for msg in messages:
-            subject = msg.get("subject", "")
-            body = msg.get("body", "") or msg.get("text", "") or ""
+        match = re.search(_CODE_PREFIX + r"[^0-9]{0,60}(\d{4,8})", text, re.IGNORECASE)
+        return match.group(1) if match else None
 
-            # Strip HTML tags to get plain text
-            plain = re.sub(r"<[^>]+>", " ", body)
-            plain = re.sub(r"\s+", " ", plain).strip()
-            content = f"{subject} {plain}"
+    def extract_otp(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Extract the verification code, preferring mails that look like OTPs.
 
-            write_log(f"OTP plain text: {content[:300]}", "INFO")
+        The old version returned the first bare 6-digit number it could find in
+        any message, so an invoice or a tracking number arriving before the
+        real mail could win. Tiers, best first:
 
-            patterns = [
-                # Qoder specific: "Verify your email" OR "start using Qoder"
-                # followed by a standalone 6-digit code
-                r"(?:verify\s+your\s+email|start\s+using\s+Qoder)[\s\S]*?(\d{6})",
-                # Generic fallback: standalone 6-digit code
-                r"\b(\d{6})\b",
-                # Other formats
-                r"verification\s*code\s*:?\s*(\d{4,8})",
-                r"code\s*:?\s*(\d{4,8})",
-                r"OTP\s*:?\s*(\d{4,8})",
-                r"passcode\s*:?\s*(\d{4,8})",
-            ]
+          1. code right after a verification-code phrase, in an OTP-looking mail
+          2. the only bare 6-digit number in an OTP-looking mail
+          3. code after such a phrase in any other mail
 
-            for pattern in patterns:
-                match = re.search(pattern, content, re.IGNORECASE)
-                if match:
-                    code = match.group(1)
-                    write_log(f"OTP extracted: {code}", "SUCCESS")
-                    return code
+        Returns None instead of guessing when the evidence is ambiguous. There
+        is deliberately no "just take the only number in the inbox" fallback:
+        a lone marketing mail would then donate its order number as the code.
+        """
+        if not messages:
+            return None
 
+        texts = [(m, self._plain(m)) for m in messages]
+        priority = [(m, t) for m, t in texts if self._looks_like_otp(m, t)]
+        rest = [(m, t) for m, t in texts if not self._looks_like_otp(m, t)]
+
+        for _, text in priority:
+            code = self._code_after_keyword(text)
+            if code:
+                write_log(f"OTP (keyword): {code}", "SUCCESS")
+                return code
+
+        for _, text in priority:
+            found = set(re.findall(r"\b(\d{6})\b", text))
+            if len(found) == 1:
+                code = found.pop()
+                write_log(f"OTP (single number): {code}", "SUCCESS")
+                return code
+
+        for _, text in rest:
+            code = self._code_after_keyword(text)
+            if code:
+                write_log(f"OTP (fallback, keyword): {code}", "SUCCESS")
+                return code
+
+        write_log("OTP not found — evidence ambiguous, not guessing", "WARNING")
         return None
 
     async def wait_for_otp(
