@@ -9,9 +9,13 @@ Endpoints:
 """
 
 import asyncio
+import http.client
+import io
 import json
 import random
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -19,6 +23,7 @@ from typing import List, Optional, Dict, Any
 
 from .config import TEMPIK_BASE
 from .utils import write_log
+from urllib.parse import urlparse
 
 # Browser-like User-Agent to bypass Cloudflare
 _BROWSER_UA = (
@@ -80,6 +85,88 @@ def sent_at_stamp() -> str:
     return utc_stamp(-_CLOCK_SKEW)
 
 
+class _KeepAlive:
+    """One HTTPS connection, kept open and rebuilt only when it breaks.
+
+    The uplink to Cloudflare measured 33% packet loss at ~300ms RTT, so a
+    fresh TLS handshake — five or six round trips, each able to lose a packet
+    — succeeded about half the time, while a request on an already-open socket
+    went through 8 out of 8. Polling every 5s used to cost twelve handshakes
+    per wait window; this turns them into one.
+
+    IPv4 is forced on purpose: this host's IPv6 route to Cloudflare accepts the
+    TCP connection and then resets the payload, and Python does not fall back.
+    """
+
+    def __init__(self, host: str, port: int = 443, timeout: float = 20.0,
+                 tls: bool = True):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.tls = tls
+        self._conn: Optional[http.client.HTTPConnection] = None
+        self._ip: Optional[str] = None
+        self._ctx = ssl.create_default_context()
+
+    def _resolve(self) -> str:
+        if self._ip:
+            return self._ip
+        infos = socket.getaddrinfo(
+            self.host, self.port, socket.AF_INET, socket.SOCK_STREAM
+        )
+        self._ip = infos[0][4][0]
+        return self._ip
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = None
+
+    def _connect(self) -> None:
+        self.close()
+        try:
+            ip = self._resolve()
+            raw = socket.create_connection((ip, self.port), timeout=self.timeout)
+        except Exception:
+            self._ip = None  # the A record may have moved
+            raise
+
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if self.tls:
+            try:
+                sock = self._ctx.wrap_socket(raw, server_hostname=self.host)
+            except Exception:
+                raw.close()
+                raise
+            conn = http.client.HTTPSConnection(
+                self.host, self.port, timeout=self.timeout
+            )
+        else:
+            sock = raw
+            conn = http.client.HTTPConnection(
+                self.host, self.port, timeout=self.timeout
+            )
+
+        conn.sock = sock  # request() then skips its own connect()
+        self._conn = conn
+
+    def request(self, method: str, path: str, body: Optional[bytes],
+                headers: Dict[str, str]) -> tuple:
+        if self._conn is None or self._conn.sock is None:
+            self._connect()
+
+        assert self._conn is not None
+        self._conn.request(method, path, body=body, headers=headers)
+        resp = self._conn.getresponse()
+        data = resp.read()
+        if resp.will_close:
+            self.close()
+        return resp.status, data
+
+
 class TempikClient:
     """Tempik disposable email API client."""
 
@@ -88,6 +175,15 @@ class TempikClient:
         self.session_id: Optional[str] = None
         self._email: Optional[str] = None
         self._domains: List[str] = []
+
+        parsed = urlparse(self.base_url)
+        self._prefix = parsed.path.rstrip("/")
+        self._http = _KeepAlive(
+            parsed.hostname or "",
+            port=parsed.port or (80 if parsed.scheme == "http" else 443),
+            timeout=20.0,
+            tls=parsed.scheme != "http",
+        )
 
     # ==================== TRANSPORT ====================
     def _request(
@@ -98,42 +194,56 @@ class TempikClient:
         with_session: bool = True,
         retries: int = _HTTP_RETRIES,
     ) -> Any:
-        """Call the tempik API, retrying transport-level failures.
+        """Call the tempik API over a reused connection.
 
         4xx answers are re-raised immediately (except 429): they mean the
         request itself is wrong, so retrying cannot change the outcome.
+        Transport failures drop the socket and retry with jittered backoff —
+        on a lossy uplink the retry is usually a different packet draw.
         """
-        url = f"{self.base_url}{path}"
-        data = None if body is None else json.dumps(body).encode()
+        target = f"{self._prefix}{path}" or "/"
+        payload = None if body is None else json.dumps(body).encode()
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": _BROWSER_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        if with_session and self.session_id:
+            headers["x-session-id"] = self.session_id
+
         last: Optional[Exception] = None
 
         for attempt in range(1, retries + 1):
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Accept", "application/json")
-            req.add_header("User-Agent", _BROWSER_UA)
-            req.add_header("Accept-Language", "en-US,en;q=0.9")
-            if data is not None:
-                req.add_header("Content-Type", "application/json")
-            if with_session and self.session_id:
-                req.add_header("x-session-id", self.session_id)
-
             try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    return json.loads(resp.read().decode())
-            except urllib.error.HTTPError as e:
-                if 400 <= e.code < 500 and e.code != 429:
-                    raise
-                last = e
+                status, raw = self._http.request(method, target, payload, headers)
+                if 400 <= status < 500 and status != 429:
+                    raise urllib.error.HTTPError(
+                        f"{self.base_url}{path}",
+                        status,
+                        f"HTTP {status}",
+                        None,
+                        io.BytesIO(raw),
+                    )
+                if status >= 400:
+                    raise IOError(f"HTTP {status}: {raw[:120]!r}")
+                return json.loads(raw.decode())
+            except urllib.error.HTTPError:
+                raise
             except Exception as e:
                 last = e
+                self._http.close()
 
             if attempt < retries:
+                delay = _RETRY_BACKOFF * attempt * random.uniform(0.8, 1.4)
                 write_log(
                     f"Tempik {method} {path} attempt {attempt}/{retries} "
                     f"failed: {last}",
                     "WARNING",
                 )
-                time.sleep(_RETRY_BACKOFF * attempt)
+                time.sleep(delay)
 
         raise last  # type: ignore[misc]
 
