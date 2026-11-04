@@ -27,6 +27,20 @@ from .pat import PATManager
 OTP_WAIT_SECONDS = 45
 OTP_ROUNDS = 3  # initial send + 2 re-sends
 
+# The OTP screen's back control is a plain text link, not a <button> — the
+# tag differs between locales/releases, so match on text and let Playwright
+# pick the innermost matching element.
+BACK_SELECTORS = [
+    'text=go back',
+    'text="Go back"',
+    'button:has-text("Go back")',
+    'a:has-text("Go back")',
+    '[role="button"]:has-text("Go back")',
+    'button:has-text("返回")',
+    'a:has-text("返回")',
+    'text=返回',
+]
+
 
 class SignupManager:
     """Handle Qoder signup + PAT creation."""
@@ -241,20 +255,23 @@ class SignupManager:
     async def _resend_verification(self, page: Page, password: str) -> bool:
         """Trigger a fresh verification code.
 
-        The OTP screen offers no resend button, only a back control that
+        The OTP screen offers no resend button, only a back link that
         returns to the password step. Re-submitting the password re-sends
         the code, but it also means passing the slider captcha again.
         """
-        back = await self._click(page, [
-            'button:has-text("返回")',
-            'a:has-text("返回")',
-            'span:has-text("返回")',
-            'button:has-text("Back")',
-        ])
+        back = await self._click(page, BACK_SELECTORS)
         if not back:
+            write_log("Back control not found on the OTP screen", "WARNING")
             return False
+        write_log(f"Resend: clicked back via {back}", "INFO")
 
-        await page.wait_for_timeout(3000)
+        # Make sure the click really landed on the password step — typing into
+        # a page that never navigated back would burn a round for nothing.
+        try:
+            await page.wait_for_selector("#basic_password", timeout=10000)
+        except Exception:
+            write_log("Back did not lead to the password step", "WARNING")
+            return False
 
         pw = await page.query_selector("#basic_password")
         if pw:
