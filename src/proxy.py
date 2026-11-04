@@ -6,7 +6,7 @@ Rotating proxy pool dengan format: http://user:pass@host:port atau host:port:use
 import os
 import random
 from typing import Optional, Dict, List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from .utils import write_log
 
@@ -52,27 +52,37 @@ class ProxyPool:
 
     @staticmethod
     def _parse(raw: str) -> Dict[str, str]:
-        """Parse proxy string into structured dict."""
-        # Format: http://user:pass@host:port
-        if raw.startswith("http"):
-            u = urlparse(raw)
-            return {
-                "server": f"{u.scheme}://{u.hostname}:{u.port}",
-                "username": u.username or "",
-                "password": u.password or "",
-            }
+        """Parse one proxy line into Playwright's {server, username, password}.
 
-        # Format: host:port:user:pass
+        Accepted:
+          scheme://[user:pass@]host:port   (http, https, socks5, socks5h)
+          host:port[:user:pass]            (scheme defaults to http)
+        """
+        raw = raw.strip()
+
+        if "://" in raw:
+            u = urlparse(raw)
+            if not u.scheme or not u.hostname or not u.port:
+                raise ValueError(f"Invalid proxy: {raw[:40]}...")
+            parsed = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+            if u.username:
+                parsed["username"] = unquote(u.username)
+            if u.password:
+                parsed["password"] = unquote(u.password)
+            return parsed
+
         parts = raw.split(":")
+
+        # host:port
+        if len(parts) == 2:
+            return {"server": f"http://{parts[0]}:{parts[1]}"}
+
+        # host:port:user:pass
         if len(parts) == 4:
             return {
                 "server": f"http://{parts[0]}:{parts[1]}",
                 "username": parts[2],
                 "password": parts[3],
             }
-
-        # Format: host:port
-        if len(parts) == 2:
-            return {"server": f"http://{parts[0]}:{parts[1]}"}
 
         raise ValueError(f"Invalid proxy format: {raw[:30]}...")
