@@ -27,7 +27,7 @@ MAX_BARREN_WAITS = 2
 # mid-flight transform and makes a 1:1 handle look like it has a 0.16 gain.
 SETTLE_TRIES = 5
 SETTLE_GAP_MS = 25
-MAX_DRAG_STEPS = 60
+MAX_DRAG_STEPS = 30
 MAX_STEP_PX = 90.0
 
 # The widget is usable only once both images decoded and the slider has width.
@@ -102,16 +102,18 @@ def _mouse_delta(target: float, observed: float, gain: float) -> float:
     return (target - observed) / max(gain, 0.2)
 
 
-async def _settled_x(page) -> Optional[float]:
+async def _settled_x(
+    page, tries: int = SETTLE_TRIES, gap_ms: int = SETTLE_GAP_MS
+) -> Optional[float]:
     """Puzzle offset once the widget stops animating it."""
     last = None
-    for _ in range(SETTLE_TRIES):
+    for _ in range(tries):
         value = await _puzzle_x(page)
         if value is not None:
             if last is not None and abs(value - last) <= 0.5:
                 return value
             last = value
-        await page.wait_for_timeout(SETTLE_GAP_MS)
+        await page.wait_for_timeout(gap_ms)
     return last
 
 
@@ -390,12 +392,16 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
             # mouse 1:1, so the first move used to be wrong for no reason: it
             # multiplied by (dl / (bgW - 52)) and then by the *handle* width.
             # A 24px probe measures the real gain instead of assuming it.
+            # Two increments, not one probe. The handle has a drag-start
+            # deadzone of a few pixels, so a single 24px sample measures
+            # (24 - deadzone) of travel and reports 0.16 on a widget that
+            # really moves ~0.21 per pixel. The delta cancels the deadzone.
             probe = 24.0
-            start_x = await _settled_x(page)
+            start_x = await _settled_x(page, tries=8, gap_ms=40)
             await page.mouse.move(sx + probe, sy, steps=6)
-            observed = await _settled_x(page)
+            first = await _settled_x(page, tries=10, gap_ms=40)
 
-            if start_x is None or observed is None or observed - start_x < 1.0:
+            if start_x is None or first is None or first - start_x < 0.5:
                 # The handle never took the drag. Release instead of spending
                 # the remaining corrections pushing a dead slider.
                 await page.mouse.up()
@@ -406,45 +412,42 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                 await page.wait_for_timeout(1200)
                 continue
 
-            measured = (observed - start_x) / probe
-            if measured < 0.5:
-                # A mid-flight sample reads far too small. Give the widget time
-                # to finish the transition before believing the ratio.
-                await page.wait_for_timeout(300)
-                again = await _settled_x(page)
-                if again is not None and again > observed:
-                    observed = again
-                    measured = (observed - start_x) / probe
-                    write_log(
-                        "Captcha: probe gain %.2f after settling" % measured, "INFO"
-                    )
-
-            gain = measured
-            if not 0.5 <= gain <= 2.0:
+            await page.mouse.move(sx + probe * 2, sy, steps=6)
+            second = await _settled_x(page, tries=10, gap_ms=40)
+            if second is not None and second - first >= 0.5:
+                gain = (second - first) / probe
+                observed = second
+                travelled = probe * 2
+            else:
+                gain = (first - start_x) / probe
+                observed = first
+                travelled = probe
                 write_log(
-                    "Captcha: probe gain %.2f is unusual, using bounded steps" % gain,
-                    "WARNING",
+                    "Captcha: second probe did not advance, keeping first sample",
+                    "INFO",
                 )
 
-            # Refuse a drag that cannot physically finish.
-            view_w = float(res.get("viewW") or 0) or 1600.0
-            needed = probe + dl / max(gain, 0.05)
-            if sx + needed > view_w - 8.0:
+            if gain <= 0.02:
                 await page.mouse.up()
-                write_log(
-                    "Captcha: needs %.0fpx of cursor travel but the window is "
-                    "%.0fpx wide, skipping" % (needed, view_w),
-                    "WARNING",
-                )
+                dumped = await _dump_dom(page, "no_follow")
+                write_log("Captcha: puzzle did not follow the probe, retrying", "WARNING")
+                if dumped:
+                    write_log("Captcha: widget geometry saved to %s" % dumped, "INFO")
                 await page.wait_for_timeout(1200)
                 continue
 
-            # Close the loop instead of trusting one computed offset. This
-            # survives an unknown gain, a clamped track and a widget that only
-            # reports 0 or its far end. The travel estimate only seeds the
-            # limit, so leave it slack.
-            cx = sx + probe
-            limit = min(sx + needed * 1.5 + 80.0, view_w - 8.0)
+            if not 0.5 <= gain <= 2.0:
+                write_log(
+                    "Captcha: probe gain %.2f, re-measuring while dragging" % gain,
+                    "INFO",
+                )
+
+            # Close the loop instead of trusting one computed offset. The
+            # travel estimate only seeds the limit: a gain measured too small
+            # overstates the travel and must not veto the attempt.
+            view_w = float(res.get("viewW") or 0) or 1600.0
+            cx = sx + travelled
+            limit = min(cx + (dl / max(gain, 0.05)) * 1.2 + 120.0, view_w - 8.0)
             final = observed
             stalled = 0
             for _ in range(MAX_DRAG_STEPS):
@@ -462,16 +465,21 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                         "WARNING",
                     )
                     if dumped:
-                        write_log(
-                            "Captcha: widget geometry saved to %s" % dumped, "INFO"
-                        )
+                        write_log("Captcha: widget geometry saved to %s" % dumped, "INFO")
                     break
-                cx = next_x
+                previous_x, cx = cx, next_x
                 await page.mouse.move(cx, sy + (random.random() - 0.5) * 1.5, steps=3)
-                await page.wait_for_timeout(30)
-                cur = await _puzzle_x(page)
+                # Settle before reading, or the loop keeps believing the piece
+                # is behind and drives the cursor into the limit.
+                cur = await _settled_x(page, tries=4, gap_ms=30)
                 if cur is None:
                     break
+                moved_cursor = cx - previous_x
+                moved_piece = cur - final
+                if abs(moved_cursor) >= 8.0 and abs(moved_piece) >= 1.0:
+                    refined = moved_piece / moved_cursor
+                    if 0.02 <= refined <= 3.0:
+                        gain = refined
                 if abs(cur - final) < 0.05:
                     stalled += 1
                     if stalled >= 5:
@@ -511,6 +519,10 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                 write_log("Captcha solved locally", "SUCCESS")
                 return True
 
+            dumped = await _dump_dom(page, "rejected")
+            write_log("Captcha solution rejected", "WARNING")
+            if dumped:
+                write_log("Captcha: widget geometry saved to %s" % dumped, "INFO")
             c.print(" [red]miss, retrying...[/]", end="")
         except Exception as e:
             c.print(f" [red]err: {str(e)[:60]}[/]")
