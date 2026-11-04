@@ -33,6 +33,48 @@ READY_JS = (
 # the captcha, so testing for it would call a stuck page "advanced".
 ADVANCED_JS = "() => !!document.querySelector('input.ant-otp-input')"
 
+# Current offset of the puzzle piece, in CSS pixels.
+#
+# The previous code read `#aliyunCaptcha-puzzle.style.left` only. When the
+# widget positions the piece with a transform instead, parseFloat('') is NaN,
+# the code fell back to 0 and every correction step assumed the piece had never
+# moved — so it kept dragging right until the mouse hit the screen edge. That is
+# why a single bad guess turned into five identical failures.
+PUZZLE_X_JS = r"""
+() => {
+  const p = document.querySelector('#aliyunCaptcha-puzzle');
+  if (!p) return null;
+  const left = parseFloat(p.style.left);
+  if (Number.isFinite(left)) return left;
+  const t = getComputedStyle(p).transform;
+  const m = /matrix\(([^)]+)\)/.exec(t || '');
+  if (m) {
+    const v = m[1].split(',').map(Number);
+    if (v.length === 6 && Number.isFinite(v[4])) return v[4];
+  }
+  return null;
+}
+"""
+
+
+async def _puzzle_x(page) -> Optional[float]:
+    """Puzzle offset in CSS px, or None when it cannot be read."""
+    try:
+        value = await page.evaluate(PUZZLE_X_JS)
+    except Exception:
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _mouse_delta(target: float, observed: float, gain: float) -> float:
+    """Mouse movement needed to bring the piece from `observed` to `target`.
+
+    `gain` is measured pixels-of-piece per pixel-of-mouse. It is 1.0 for every
+    widget seen so far; the calibration exists so a scaled or transformed
+    widget cannot silently break the drag.
+    """
+    return (target - observed) / max(gain, 0.2)
+
 
 async def _flow_advanced(page) -> bool:
     """True when the page already sits on a later step than the captcha."""
@@ -219,39 +261,71 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                 continue
 
             dl = res["displayLeft"]
-            sx = res["sliderX"] + 10
+            sx = res["sliderX"] + min(10.0, max(res["sliderW"] / 3, 2.0))
             sy = res["sliderY"] + res["sliderH"] / 2
-            track = res["sliderW"]
-            max_pz = res["bgDisplayW"] - 52
 
             c.print(f" targetX={res['targetX']}, score={res.get('score',0):.3f}" +
               f" [dim]({res.get('method','?')})[/]")
 
-            # Drag: coarse move
             await page.mouse.move(sx, sy)
             await page.wait_for_timeout(80)
             await page.mouse.down()
             await page.wait_for_timeout(40)
 
-            frac = dl / max(max_pz, 1)
-            cx = sx + frac * track
-            await page.mouse.move(cx, sy, steps=10)
+            # `displayLeft` is already in CSS pixels and the piece follows the
+            # mouse 1:1, so the first move used to be wrong for no reason: it
+            # multiplied by (dl / (bgW - 52)) and then by the *handle* width.
+            # A 24px probe measures the real gain instead of assuming it.
+            start_x = await _puzzle_x(page)
+            probe = 24.0
+            await page.mouse.move(sx + probe, sy, steps=6)
+
+            gain = 1.0
+            observed = await _puzzle_x(page)
+            if start_x is not None and observed is not None:
+                measured = (observed - start_x) / probe
+                if measured <= 0.02:
+                    # The handle never took the drag. Release instead of
+                    # spending the remaining corrections pushing a dead slider.
+                    await page.mouse.up()
+                    write_log("Captcha: puzzle did not follow the probe, retrying", "WARNING")
+                    await page.wait_for_timeout(1200)
+                    continue
+                gain = measured
+
+            # Unreadable position: assume the probe moved the piece by its own
+            # length, which is what a 1:1 widget does.
+            here = observed if observed is not None else probe
+            cx = sx + probe + _mouse_delta(dl, here, gain)
+            cx = min(cx, sx + res["bgDisplayW"])
+            await page.mouse.move(cx, sy, steps=12)
             await page.wait_for_timeout(120)
 
-            # Refine loop (tolerance 2px)
-            for step in range(60):
-                cur = await page.evaluate(
-                    "() => parseFloat(document.querySelector('#aliyunCaptcha-puzzle')?.style.left)||0"
-                )
-                rem = dl - cur
-                if abs(rem) <= 2:
+            # Fine-tune against what the widget reports (tolerance ~1.5px).
+            final = None
+            for _ in range(8):
+                cur = await _puzzle_x(page)
+                if cur is None:
                     break
-                delta = max(-50, min(50, rem * (track / max(max_pz, 1))))
-                cx += delta + (random.random() - 0.5) * 2
-                await page.mouse.move(cx, sy + (random.random() - 0.5) * 2, steps=5)
+                final = cur
+                if abs(cur - dl) <= 1.5:
+                    break
+                cx += _mouse_delta(dl, cur, gain)
+                await page.mouse.move(cx, sy + (random.random() - 0.5) * 1.5, steps=4)
                 await page.wait_for_timeout(20)
 
             await page.mouse.up()
+            write_log(
+                "Captcha drag: target=%.1f gain=%.2f landed=%s bgW=%.0f handleW=%.0f"
+                % (
+                    dl,
+                    gain,
+                    "-" if final is None else "%.1f" % final,
+                    res["bgDisplayW"],
+                    res["sliderW"],
+                ),
+                "INFO",
+            )
             await page.wait_for_timeout(2500)
 
             # Cek apakah solved
