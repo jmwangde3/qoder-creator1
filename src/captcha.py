@@ -176,12 +176,23 @@ async def _smooth_move(
     moves separated by fixed pauses read as a robot, which is why a drag that
     landed within 1px was still rejected.
     """
+    total = to_x - from_x
+    # The last leg has to be an actual jump. The widget ignores pointer deltas
+    # below a few pixels, and an eased tail ends in 1-2px samples that are all
+    # swallowed: a 232px drag came up 8-9px short every time, which is exactly
+    # the sum of the discarded tail. Ease to 92%, then step the rest.
+    final_leg = min(abs(total), max(12.0, abs(total) * 0.08))
+    eased_to = to_x - (final_leg if total >= 0 else -final_leg)
+
     for index in range(1, segments + 1):
         fraction = index / segments
         eased = 1.0 - (1.0 - fraction) ** 2
-        x = from_x + (to_x - from_x) * eased
+        x = from_x + (eased_to - from_x) * eased
         await page.mouse.move(x, y + (random.random() - 0.5) * 1.4, steps=2)
         await page.wait_for_timeout(gap_ms)
+
+    if final_leg > 0.5:
+        await page.mouse.move(to_x, y + (random.random() - 0.5) * 1.4, steps=1)
 
 
 async def _flow_advanced(page) -> bool:
@@ -456,11 +467,17 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                 final = settled
 
             stuck = 0
+            boost = 1.0
+            trims = 0
             for _ in range(6):
                 error = dl - final
-                if abs(error) <= 1.5:
+                if abs(error) <= 1.0:
                     break
-                next_cx = min(cx + error, headroom)
+                # A correction smaller than the widget's sampling threshold is
+                # discarded silently, so grow the step instead of repeating it
+                # and giving up: the residue left by the eased tail was 7-9px
+                # and the widget simply ignored every 2px nudge.
+                next_cx = min(cx + error * boost, headroom)
                 moved_cursor = next_cx - cx
                 if abs(moved_cursor) < 1.0:
                     dumped = await _dump_dom(page, "edge")
@@ -473,15 +490,21 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                         write_log("Captcha: widget geometry saved to %s" % dumped, "INFO")
                     break
                 previous = final
-                await _smooth_move(page, cx, next_cx, sy, segments=4, gap_ms=14)
+                # Keep each segment above the sampling threshold too, or the
+                # trim repeats the same mistake as the eased tail.
+                trim_segments = max(2, min(5, int(abs(moved_cursor) / 10) or 2))
+                await _smooth_move(
+                    page, cx, next_cx, sy, segments=trim_segments, gap_ms=16
+                )
                 cx = next_cx
+                trims += 1
                 settled = await _settled_x(page, tries=6, gap_ms=30)
                 if settled is None:
                     break
                 final = settled
                 if abs(final - previous) < 0.5:
                     stuck += 1
-                    if stuck >= 2:
+                    if stuck >= 3:
                         dumped = await _dump_dom(page, "stalled")
                         write_log(
                             "Captcha: piece stopped responding at %.1f/%.1f"
@@ -494,16 +517,22 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                                 "INFO",
                             )
                         break
+                    boost = min(boost * 3.0, 16.0)
                 else:
                     stuck = 0
+                    boost = 1.0
 
             await page.mouse.up()
+            residual = float("nan") if final is None else dl - final
             write_log(
-                "Captcha drag: target=%.1f probe=%.0f landed=%s bgW=%.0f handleW=%.0f"
+                "Captcha drag: target=%.1f probe=%.0f landed=%s trim=%d "
+                "residual=%+.1f bgW=%.0f handleW=%.0f"
                 % (
                     dl,
                     probe,
                     "-" if final is None else "%.1f" % final,
+                    trims,
+                    residual,
                     res["bgDisplayW"],
                     res["sliderW"],
                 ),

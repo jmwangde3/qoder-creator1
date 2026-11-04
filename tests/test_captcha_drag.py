@@ -35,8 +35,13 @@ class SmoothMoveTest(unittest.IsolatedAsyncioTestCase):
     async def test_ends_exactly_on_target(self):
         page = FakePage()
         await _smooth_move(page, 100.0, 250.0, 50.0, segments=8, gap_ms=0)
-        self.assertEqual(len(page.mouse.points), 8)
+        # Eased samples plus one deliberate final step: the widget drops
+        # sub-threshold pointer deltas, so the tail cannot be eased to zero.
+        self.assertEqual(len(page.mouse.points), 9)
         self.assertAlmostEqual(page.mouse.points[-1], 250.0, delta=0.01)
+        self.assertGreaterEqual(
+            page.mouse.points[-1] - page.mouse.points[-2], 12.0
+        )
 
     async def test_forward_arc_is_monotonic(self):
         page = FakePage()
