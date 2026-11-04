@@ -1,44 +1,67 @@
-"""The slider drag must land where the solver says, not 1/4 of the way there.
+"""Regression tests for the smooth drag arc.
 
-A run failed 7 of 50 accounts on the captcha, and every one of them failed all
-five attempts. The screenshots show the piece sitting at the far left of the
-image while the gap is ~165px away, and the code explains it: `displayLeft` is
-already in CSS pixels, but the drag multiplied it by (dl / (bgW - 52)) and then
-by the *handle* width, so the first move landed far short. The coarse move was
-supposed to be corrected by a refine loop reading `#aliyunCaptcha-puzzle.style.left`
-— which is empty when the widget positions the piece with a transform, so the
-loop believed the piece had never moved and kept pushing right.
-
-These tests pin the arithmetic that replaces it: a straight 1:1 offset, scaled
-by the gain measured from a short probe.
+The widget grades the trajectory, not only the endpoint, so the arc has to be
+monotonic, eased and finish exactly on the requested position. These are pure
+arithmetic checks; no browser needed.
 """
+
 import pathlib
 import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from src.captcha import _mouse_delta  # noqa: E402
+from src.captcha import _smooth_move  # noqa: E402
 
 
-class MouseDeltaTest(unittest.TestCase):
-    def test_remaining_distance_is_one_to_one(self):
-        # Probe moved the piece to 24; the gap is at 165 -> 141 more pixels.
-        self.assertAlmostEqual(_mouse_delta(165.0, 24.0, 1.0), 141.0)
+class FakeMouse:
+    def __init__(self):
+        self.points = []
 
-    def test_gain_scales_the_correction(self):
-        # Half a pixel of piece per pixel of mouse needs twice the movement.
-        self.assertAlmostEqual(_mouse_delta(165.0, 24.0, 0.5), 282.0)
+    async def move(self, x, _y, steps=1):
+        self.points.append(float(x))
 
-    def test_overshoot_corrects_backwards(self):
-        self.assertAlmostEqual(_mouse_delta(100.0, 140.0, 1.0), -40.0)
 
-    def test_zero_gain_cannot_divide_by_zero(self):
-        # A dead slider still has to produce a finite number.
-        self.assertAlmostEqual(_mouse_delta(100.0, 0.0, 0.0), 500.0)
+class FakePage:
+    def __init__(self):
+        self.mouse = FakeMouse()
+        self.pauses = []
 
-    def test_already_on_target(self):
-        self.assertAlmostEqual(_mouse_delta(50.0, 50.0, 1.0), 0.0)
+    async def wait_for_timeout(self, milliseconds):
+        self.pauses.append(milliseconds)
+
+
+class SmoothMoveTest(unittest.IsolatedAsyncioTestCase):
+    async def test_ends_exactly_on_target(self):
+        page = FakePage()
+        await _smooth_move(page, 100.0, 250.0, 50.0, segments=8, gap_ms=0)
+        self.assertEqual(len(page.mouse.points), 8)
+        self.assertAlmostEqual(page.mouse.points[-1], 250.0, delta=0.01)
+
+    async def test_forward_arc_is_monotonic(self):
+        page = FakePage()
+        await _smooth_move(page, 120.0, 380.0, 50.0, segments=10, gap_ms=0)
+        for previous, current in zip(page.mouse.points, page.mouse.points[1:]):
+            self.assertLess(previous, current)
+
+    async def test_backward_arc_is_monotonic(self):
+        page = FakePage()
+        await _smooth_move(page, 380.0, 120.0, 50.0, segments=10, gap_ms=0)
+        for previous, current in zip(page.mouse.points, page.mouse.points[1:]):
+            self.assertGreater(previous, current)
+
+    async def test_ease_out_covers_most_ground_early(self):
+        # A human decelerates: over half the segments the cursor should have
+        # covered well over half the distance.
+        page = FakePage()
+        await _smooth_move(page, 0.0, 260.0, 50.0, segments=10, gap_ms=0)
+        halfway = page.mouse.points[4]
+        self.assertGreater(halfway, 130.0)
+
+    async def test_pauses_once_per_segment(self):
+        page = FakePage()
+        await _smooth_move(page, 0.0, 90.0, 50.0, segments=6, gap_ms=18)
+        self.assertEqual(page.pauses, [18] * 6)
 
 
 if __name__ == "__main__":
