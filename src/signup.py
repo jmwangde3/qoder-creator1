@@ -222,15 +222,24 @@ class SignupManager:
 
     @staticmethod
     async def _click(page: Page, selectors: list) -> Optional[str]:
-        """Click first visible selector."""
+        """Click the first *visible* match for each selector, in order.
+
+        query_selector() only ever returns the first node in DOM order, so a
+        wizard that keeps previous steps around (hidden) would make the click
+        stick to an invisible button and silently time out.
+        """
         for sel in selectors:
             try:
-                el = await page.query_selector(sel)
-                if el and await el.is_visible():
-                    await el.click()
-                    return sel
+                elements = await page.query_selector_all(sel)
             except Exception:
                 continue
+            for el in elements:
+                try:
+                    if await el.is_visible():
+                        await el.click()
+                        return sel
+                except Exception:
+                    continue
         return None
 
 

@@ -26,7 +26,7 @@ from rich.table import Table
 from rich.text import Text
 
 from src.config import (
-    DATA_DIR, ACCOUNTS_FILE, PROXY_FILE, LOG_FILE, PROXY_MODE,
+    DATA_DIR, ACCOUNTS_FILE, PROXY_FILE, LOG_FILE, PROXY_MODE, HEADLESS,
 )
 from src.utils import setup_logging, load_jsonl
 from src.proxy import ProxyPool
@@ -114,7 +114,7 @@ async def menu_signup_cli(count: int):
         console=console,
     ) as progress:
         task = progress.add_task("[cyan]Creating accounts...", total=count)
-        manager = SignupManager(proxy_pool, headless=True, console=console)
+        manager = SignupManager(proxy_pool, headless=HEADLESS, console=console)
 
         results = []
         for i in range(count):
@@ -250,7 +250,7 @@ def main():
         menu_view_results()
     else:
         console.print(f"[red]Unknown command:[/] {command}")
-        console.print("[dim]Usage: python main.py [signup|view] [-n N][/]")
+        console.print(Text("Usage: python main.py [signup|view] [-n N]", style="dim"))
 
 
 if __name__ == "__main__":

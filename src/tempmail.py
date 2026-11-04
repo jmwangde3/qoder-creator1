@@ -26,6 +26,10 @@ _BROWSER_UA = (
     "Chrome/132.0.0.0 Safari/537.36"
 )
 
+# /config is not worth failing an account over, but one flaky TLS handshake
+# used to poison the domain list for the whole run — retry a couple of times.
+_FETCH_RETRIES = 3
+
 
 class TempikClient:
     """Tempik disposable email API client."""
@@ -38,22 +42,51 @@ class TempikClient:
 
     # ==================== CONFIG ====================
     def _fetch_domains(self) -> List[str]:
-        """Fetch available domains from /api/config. Cached."""
+        """Fetch available domains from /api/config. Cached.
+
+        Returns [] when the endpoint stays unreachable, so create_inbox() can
+        omit `domain` and let the server pick its default. Falling back to a
+        hardcoded domain was worse: the server rejects unknown domains with
+        HTTP 400 and every signup fails.
+        """
         if self._domains:
             return self._domains
-        try:
-            url = f"{self.base_url}/config"
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("Accept", "application/json")
-            req.add_header("User-Agent", _BROWSER_UA)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            self._domains = data.get("mailDomains", [data.get("mailDomain", "exse7en.fr")])
-            write_log(f"Tempik domains: {self._domains}", "INFO")
-        except Exception as e:
-            write_log(f"Tempik domain fetch failed: {e}, using default", "WARNING")
-            self._domains = ["exse7en.fr"]
-        return self._domains
+
+        url = f"{self.base_url}/config"
+        last: Optional[Exception] = None
+
+        for attempt in range(1, _FETCH_RETRIES + 1):
+            try:
+                req = urllib.request.Request(url, method="GET")
+                req.add_header("Accept", "application/json")
+                req.add_header("User-Agent", _BROWSER_UA)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+
+                domains = data.get("mailDomains") or []
+                if not domains and data.get("mailDomain"):
+                    domains = [data["mailDomain"]]
+                if domains:
+                    self._domains = domains
+                    write_log(f"Tempik domains: {self._domains}", "INFO")
+                    return self._domains
+
+                last = ValueError("response has no mailDomains/mailDomain")
+            except Exception as e:
+                last = e
+
+            write_log(
+                f"Tempik domain fetch {attempt}/{_FETCH_RETRIES} failed: {last}",
+                "WARNING",
+            )
+            if attempt < _FETCH_RETRIES:
+                time.sleep(1.5 * attempt)
+
+        write_log(
+            f"Tempik domain fetch gave up ({last}); using server default domain",
+            "WARNING",
+        )
+        return []
 
     # ==================== SESSION ====================
     def init_session(self) -> str:
@@ -85,10 +118,12 @@ class TempikClient:
         # Pick random domain if not specified
         if not domain:
             domains = self._fetch_domains()
-            domain = random.choice(domains)
+            domain = random.choice(domains) if domains else None
 
         url = f"{self.base_url}/inboxes"
-        body_data = {"domain": domain}
+        body_data: Dict[str, Any] = {}
+        if domain:
+            body_data["domain"] = domain
         if local_part:
             body_data["localPart"] = local_part
         body = json.dumps(body_data).encode()
@@ -103,7 +138,7 @@ class TempikClient:
             data = json.loads(resp.read().decode())
 
         self._email = data.get("address")
-        write_log(f"Tempik inbox: {self._email} (domain={domain})", "INFO")
+        write_log(f"Tempik inbox: {self._email} (domain={domain or 'server-default'})", "INFO")
         return self._email
 
     # ==================== MESSAGES ====================
