@@ -427,11 +427,13 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
                 )
 
             # Refuse a drag that cannot physically finish.
+            view_w = float(res.get("viewW") or 0) or 1600.0
             needed = probe + dl / max(gain, 0.05)
-            if needed > 1600.0:
+            if sx + needed > view_w - 8.0:
                 await page.mouse.up()
                 write_log(
-                    "Captcha: needs %.0fpx of cursor travel, skipping" % needed,
+                    "Captcha: needs %.0fpx of cursor travel but the window is "
+                    "%.0fpx wide, skipping" % (needed, view_w),
                     "WARNING",
                 )
                 await page.wait_for_timeout(1200)
@@ -441,7 +443,6 @@ async def solve_slider_local(page, max_attempts: int = 5, console: Console = Non
             # survives an unknown gain, a clamped track and a widget that only
             # reports 0 or its far end. The travel estimate only seeds the
             # limit, so leave it slack.
-            view_w = float(res.get("viewW") or 0) or 1600.0
             cx = sx + probe
             limit = min(sx + needed * 1.5 + 80.0, view_w - 8.0)
             final = observed
