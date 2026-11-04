@@ -113,9 +113,9 @@ Each successful account is appended to `data/accounts.jsonl`:
 
 ## Temp Mail
 
-This project uses [**tempik**](https://github.com/hirotomasato/tempik) � deployed on your Cloudflare Workers — a lightweight disposable email API written in Node.js. Deploy on your own Cloudflare Workers � see the [tempik repo](https://github.com/hirotomasato/tempik) for setup instructions.
+This project uses [**tempik**](https://github.com/hirotomasato/tempik) — deployed on your Cloudflare Workers — a lightweight disposable email API written in Node.js. Deploy on your own Cloudflare Workers — see the [tempik repo](https://github.com/hirotomasato/tempik) for setup instructions.
 
-Set your Cloudflare Workers URL in `config.toml` ? `tempmail_base`.
+Set your Cloudflare Workers URL in `config.toml` → `tempmail_base`.
 
 ## Claim / Trial
 
