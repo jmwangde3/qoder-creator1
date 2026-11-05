@@ -90,6 +90,24 @@ DEFAULT_PASSWORD_LENGTH = 14
 DEFAULT_TIMEOUT = 120000
 DEFAULT_OTP_TIMEOUT = 150
 
+# Human fallback for the slider. Automatic solving is the default; when every
+# attempt fails and a *visible* browser is running, give a person a bounded
+# window to drag the puzzle themselves. It is deliberately short and bounded:
+# nobody is guaranteed to be watching the screen, and a batch must never hang
+# on one account. Headless runs skip it entirely (there is nothing to look at).
+# Env overrides exist so an unattended cron job can force it off without
+# editing config.toml.
+MANUAL_FALLBACK = os.getenv(
+    "QODER_MANUAL_FALLBACK",
+    str(_cfg("captcha", "manual_fallback", default=True)),
+).strip().lower() not in ("0", "false", "no", "off")
+MANUAL_TIMEOUT = float(
+    os.getenv(
+        "QODER_MANUAL_TIMEOUT",
+        str(_cfg("captcha", "manual_timeout", default=45)),
+    )
+)
+
 # Ensure data dir exists
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 

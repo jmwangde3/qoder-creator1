@@ -12,7 +12,9 @@ from playwright.async_api import async_playwright, Page
 from rich.console import Console
 from rich.text import Text
 
-from .config import QODER_BASE, ACCOUNTS_FILE
+from .config import (
+    QODER_BASE, ACCOUNTS_FILE, MANUAL_FALLBACK, MANUAL_TIMEOUT,
+)
 from .utils import write_log, generate_password, save_jsonl
 from .tempmail import TempikClient, sent_at_stamp
 from .proxy import ProxyPool
@@ -209,7 +211,13 @@ class SignupManager:
                 ])
                 await page.wait_for_timeout(3000)
 
-                solved = await solve_slider_local(page, max_attempts=5, console=c)
+                solved = await solve_slider_local(
+                    page,
+                    max_attempts=5,
+                    console=c,
+                    manual_fallback=(MANUAL_FALLBACK and not self.headless),
+                    manual_timeout=MANUAL_TIMEOUT,
+                )
                 if not solved:
                     c.print("  :x: [red]Captcha failed![/]")
                     write_log(f"[{idx}] Captcha failed for {email}", "ERROR")
@@ -419,7 +427,13 @@ class SignupManager:
         ])
         await page.wait_for_timeout(3000)
 
-        if not await solve_slider_local(page, max_attempts=5, console=self.console):
+        if not await solve_slider_local(
+            page,
+            max_attempts=5,
+            console=self.console,
+            manual_fallback=(MANUAL_FALLBACK and not self.headless),
+            manual_timeout=MANUAL_TIMEOUT,
+        ):
             return None
 
         write_log(f"Resend: fresh code requested at {send_at}", "INFO")

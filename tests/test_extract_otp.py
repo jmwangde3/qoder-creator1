@@ -86,6 +86,36 @@ class ExtractOtpTest(unittest.TestCase):
         )
         self.assertEqual(self.c.extract_otp([msg]), "482913")
 
+    def test_css_colour_is_not_the_code(self):
+        # <style> contents survive the tag stripper. Without the blacklist
+        # this 000000 either wins the keyword match or makes the real code
+        # look ambiguous (two 6-digit numbers in one mail).
+        msg = mail(
+            "no-reply@qoder.com",
+            "Verify your email",
+            "<html><style>body{color:#000000}div{color:#ffffff}</style>"
+            "<body><p>Your verification code is</p><b>482913</b></body></html>",
+        )
+        self.assertEqual(self.c.extract_otp([msg]), "482913")
+
+    def test_keyword_match_skips_a_colour_and_keeps_looking(self):
+        msg = mail(
+            "no-reply@qoder.com",
+            "Verify your email",
+            "<html><style>body{color:#464646}</style><body>"
+            "<p>Your verification code is 000000</p>"
+            "<p>Verification code: 731904</p></body></html>",
+        )
+        self.assertEqual(self.c.extract_otp([msg]), "731904")
+
+    def test_only_a_css_colour_is_not_a_code(self):
+        msg = mail(
+            "no-reply@qoder.com",
+            "Verify your email",
+            "<html><style>body{color:#000000}</style><body><p>Done</p></body></html>",
+        )
+        self.assertIsNone(self.c.extract_otp([msg]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

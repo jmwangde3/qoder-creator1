@@ -14,7 +14,9 @@ import time
 from typing import Awaitable, Callable, Optional
 
 from rich.console import Console
+from rich.panel import Panel
 
+from .config import MANUAL_TIMEOUT
 from .utils import write_log
 
 
@@ -54,12 +56,59 @@ TRIM_TOLERANCE = 1.6
 # tell "the drag missed" from "the solver aimed at the wrong x".
 SNAP_CHALLENGES = True
 
-READY_JS = (
-    "() => { const i=document.querySelector('#aliyunCaptcha-img');"
-    " const s=document.querySelector('#aliyunCaptcha-sliding-slider');"
-    " return !!(i&&i.complete&&i.naturalWidth>0"
-    "&&s&&s.getBoundingClientRect().width>0); }"
+# The widget is identified by its published IDs first and by generic shapes
+# only as a fallback. Qoder has shipped more than one Aliyun markup revision
+# (the archives contain both 480px sprites and 52px puzzle images), so a hard
+# coded selector would fail closed on the next revision. The image-processing
+# pipeline still uses the canonical IDs -- a renamed widget needs a real
+# rewrite of the solver, not just a different selector -- but presence checks,
+# click targets and "is it gone yet" must survive a cosmetic change.
+_WIDGET_FIND_JS = r"""
+  const _find = (sels) => {
+    for (const s of sels) {
+      const e = document.querySelector(s);
+      if (e && e.offsetParent !== null) return e;
+    }
+    return null;
+  };
+  const _IMG_SELS = ['#aliyunCaptcha-img', '.aliyunCaptcha-img',
+                     '[id*="captcha"] img', 'img[src*="captcha"]'];
+  const _PUZZLE_SELS = ['#aliyunCaptcha-puzzle', '.aliyunCaptcha-puzzle',
+                        '[id*="captcha"] [class*="puzzle"]'];
+  const _SLIDER_SELS = ['#aliyunCaptcha-sliding-slider',
+                        '#aliyunCaptcha-sliding .aliyunCaptcha-sliding-btn',
+                        '.nc_iconfont.btn_slide', '.slide-verify-slider',
+                        '[id*="sliding-slider"]', '[class*="slider"] [class*="btn"]'];
+  const _WRAPPER_SELS = ['#aliyunCaptcha-captcha-wrapper', '#aliyunCaptcha-sliding',
+                         '.aliyunCaptcha', '#nc_1_wrapper', '.nc-container',
+                         '.slide-verify', '[id*="captcha-wrapper"]'];
+"""
+
+# Click targets that make the challenge appear, and selectors whose arrival
+# means it has rendered. Playwright accepts a comma-separated CSS list, so one
+# call covers every known revision.
+_CLICK_TRIGGER_SELECTORS = (
+    "#aliyunCaptcha-captcha-left",
+    "#aliyunCaptcha-captcha-body",
+    'button:has-text("Click to verify")',
+    'button:has-text("点击验证")',
+    '[class*="captcha"] [class*="btn"]',
 )
+_WIDGET_APPEAR_SELECTORS = (
+    "#aliyunCaptcha-img",
+    "#aliyunCaptcha-captcha-wrapper",
+    ".aliyunCaptcha",
+    ".slide-verify",
+    ".nc-container",
+    '[id*="captcha"] img',
+)
+
+READY_JS = "() => { " + _WIDGET_FIND_JS + r"""
+  const i = _find(_IMG_SELS), s = _find(_SLIDER_SELS);
+  const loaded = i && (i.complete === undefined || i.complete)
+                   && (i.naturalWidth === undefined || i.naturalWidth > 0);
+  return !!(loaded && s && s.getBoundingClientRect().width > 0);
+}"""
 
 
 PUZZLE_X_JS = r"""
@@ -632,50 +681,99 @@ def _install_verdict_hook(page) -> list[str]:
 
 
 async def widget_state(page) -> dict:
-    return await page.evaluate(
-        """() => ({
-            img: !!document.querySelector('#aliyunCaptcha-img'),
-            puzzle: !!document.querySelector('#aliyunCaptcha-puzzle'),
-            slider: !!document.querySelector('#aliyunCaptcha-sliding-slider'),
+    return await page.evaluate("() => { " + _WIDGET_FIND_JS + r"""
+        return {
+            img: !!_find(_IMG_SELS),
+            puzzle: !!_find(_PUZZLE_SELS),
+            slider: !!_find(_SLIDER_SELS),
+            wrapper: !!_find(_WRAPPER_SELS),
             body: !!document.querySelector('#aliyunCaptcha-captcha-body'),
-            wrapper: !!document.querySelector('#aliyunCaptcha-captcha-wrapper')
-        })"""
-    )
+            anyVisible: !!(_find(_IMG_SELS) || _find(_WRAPPER_SELS))
+        };
+    }""")
 
 
 async def is_solved(page) -> bool:
     try:
-        wrapper_visible = await page.evaluate(
-            """() => {
-                const node=document.querySelector('#aliyunCaptcha-captcha-wrapper');
-                return node ? node.offsetParent !== null : false;
-            }"""
-        )
-        slider_visible = await page.evaluate(
-            """() => {
-                const node=document.querySelector('#aliyunCaptcha-sliding-slider');
-                return node ? node.offsetParent !== null : false;
-            }"""
-        )
-        if not wrapper_visible or not slider_visible:
-            return True
-        return bool(
-            await page.evaluate(
-                """() => {
-                    const slider=document.querySelector('#aliyunCaptcha-sliding-slider');
-                    const body=document.querySelector('#aliyunCaptcha-captcha-body');
-                    const icon=document.querySelector(
-                        '#aliyunCaptcha-check-icon,[class*=success],[class*=pass]'
-                    );
-                    if(icon&&icon.offsetParent!==null)return true;
-                    if(slider&&(slider.className.includes('success')||slider.className.includes('pass')))return true;
-                    if(body&&(body.className.includes('success')||body.className.includes('pass')))return true;
-                    return false;
-                }"""
-            )
-        )
+        return await page.evaluate("() => { " + _WIDGET_FIND_JS + r"""
+            const wrapper = _find(_WRAPPER_SELS);
+            const slider = _find(_SLIDER_SELS);
+            if (!wrapper || !slider) return true;
+            const body = document.querySelector('#aliyunCaptcha-captcha-body');
+            const icon = document.querySelector(
+                '#aliyunCaptcha-check-icon,[class*=success],[class*=pass]'
+            );
+            if (icon && icon.offsetParent !== null) return true;
+            if (String(slider.className || '').includes('success') || String(slider.className || '').includes('pass')) return true;
+            if (body && (String(body.className || '').includes('success') || String(body.className || '').includes('pass'))) return true;
+            return false;
+        }""")
     except Exception:
         return False
+
+
+MANUAL_POLL_MS = 500
+MANUAL_HINT_SECONDS = 10.0
+
+
+async def _wait_for_human(
+    page,
+    timeout_s: float,
+    emit: Callable[[str], None],
+    verdicts: Optional[list[str]] = None,
+    verdict_mark: int = 0,
+    solved_fn: Callable = is_solved,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Give a person a bounded chance to drag the puzzle themselves.
+
+    This is the last resort after every automatic attempt failed. It is not a
+    replacement for solving: the caller is usually an unattended batch, so the
+    window is short, hard-bounded, and always ends with a decision. Headless
+    runs never get here (the caller skips them -- there is nothing to see).
+
+    A verdict of T001 is the only unambiguous success signal. The widget also
+    disappears for a moment while it reloads after a rejected attempt, so a
+    bare "widget gone" reading needs two consecutive samples before it counts.
+    """
+    if timeout_s <= 0:
+        emit("captcha manual fallback disabled (timeout<=0)")
+        return False
+    emit(
+        f"captcha manual fallback: up to {timeout_s:.0f}s for a human drag "
+        f"(auto-continues, no input needed)"
+    )
+    start = clock()
+    deadline = start + timeout_s
+    settled = 0
+    next_hint = MANUAL_HINT_SECONDS
+    while True:
+        now = clock()
+        if now >= deadline:
+            break
+        if verdicts and any(v == "T001" for v in verdicts[verdict_mark:]):
+            emit(f"captcha solved manually (T001) after {now - start:.1f}s")
+            return True
+        if await solved_fn(page):
+            settled += 1
+            if settled >= 2:
+                emit(
+                    f"captcha solved manually (widget gone) after "
+                    f"{now - start:.1f}s"
+                )
+                return True
+        else:
+            settled = 0
+        elapsed = now - start
+        if elapsed >= next_hint:
+            emit(f"captcha manual fallback: {timeout_s - elapsed:.0f}s left")
+            next_hint += MANUAL_HINT_SECONDS
+        await page.wait_for_timeout(MANUAL_POLL_MS)
+    emit(
+        f"captcha manual fallback timed out after {timeout_s:.0f}s; "
+        f"giving up on this account"
+    )
+    return False
 
 
 async def solve_slider_local(
@@ -684,6 +782,8 @@ async def solve_slider_local(
     console: Optional[Console] = None,
     log: Optional[Callable[[str], None]] = None,
     flow_advanced: Optional[Callable[[], Awaitable[bool]]] = None,
+    manual_fallback: bool = False,
+    manual_timeout: float = MANUAL_TIMEOUT,
 ) -> bool:
     def emit(message: str) -> None:
         if log:
@@ -699,14 +799,16 @@ async def solve_slider_local(
         verdict_mark = len(verdicts)
         try:
             try:
-                await page.click("#aliyunCaptcha-captcha-left", timeout=2000)
+                await page.click(
+                    ", ".join(_CLICK_TRIGGER_SELECTORS), timeout=2000
+                )
                 await page.wait_for_timeout(1500)
             except Exception:
                 pass
 
             try:
                 await page.wait_for_selector(
-                    "#aliyunCaptcha-img, #aliyunCaptcha-captcha-wrapper",
+                    ", ".join(_WIDGET_APPEAR_SELECTORS),
                     timeout=CONTAINER_TIMEOUT_MS,
                 )
             except Exception:
@@ -907,6 +1009,25 @@ async def solve_slider_local(
         except Exception as exc:
             emit(f"captcha error {type(exc).__name__}")
         await page.wait_for_timeout(1000)
+
+    if manual_fallback:
+        if console is not None:
+            console.print(
+                Panel.fit(
+                    "[bold yellow]滑块自动求解失败[/]\n"
+                    f"浏览器窗口已打开，{manual_timeout:.0f} 秒内可手动拖动拼图。\n"
+                    "[dim]无需守着：到点自动放弃，批量会继续下一个账号。[/]",
+                    border_style="yellow",
+                )
+            )
+        return await _wait_for_human(
+            page,
+            manual_timeout,
+            emit,
+            verdicts=verdicts,
+            verdict_mark=len(verdicts),
+        )
+    emit("captcha manual fallback skipped (headless or disabled)")
     return False
 
 

@@ -6,6 +6,8 @@ Flow: tempik (temp mail) -> signup -> captcha -> OTP -> PAT
 Usage:
   python main.py              # Interactive menu
   python main.py signup -n 5  # Create 5 accounts
+  python main.py signup -n 5 --headed   # Visible browser + human fallback
+  python main.py doctor       # Check the environment before a batch
   python main.py view         # View results
 """
 
@@ -27,6 +29,7 @@ from rich.text import Text
 
 from src.config import (
     DATA_DIR, ACCOUNTS_FILE, PROXY_FILE, LOG_FILE, PROXY_MODE, HEADLESS,
+    MANUAL_FALLBACK, MANUAL_TIMEOUT, TEMPIK_BASE,
 )
 from src.utils import setup_logging, load_jsonl, write_log
 from src.proxy import ProxyPool
@@ -101,10 +104,17 @@ async def menu_signup():
         console.print(Panel("[FAIL] All accounts failed!", style="red"))
 
 
-async def menu_signup_cli(count: int):
+async def menu_signup_cli(count: int, headless: bool = None):
     """Non-interactive CLI signup (rich)."""
+    if headless is None:
+        headless = HEADLESS
     console.print()
     console.print(Panel(f"CREATING [cyan]{count}[/] ACCOUNT(S)", style="bold cyan", box=box.HEAVY))
+    if not headless and MANUAL_FALLBACK:
+        console.print(
+            f"  [yellow]Visible browser:[/] if the slider fails {MANUAL_TIMEOUT:.0f}s "
+            f"of human time is offered, then the batch continues automatically."
+        )
 
     proxy_pool = None
     if PROXY_FILE.exists():
@@ -120,7 +130,7 @@ async def menu_signup_cli(count: int):
         console=console,
     ) as progress:
         task = progress.add_task("[cyan]Creating accounts...", total=count)
-        manager = SignupManager(proxy_pool, headless=HEADLESS, console=console)
+        manager = SignupManager(proxy_pool, headless=headless, console=console)
 
         results = []
         for i in range(count):
@@ -239,6 +249,95 @@ async def interactive_menu():
             console.print("[red]Invalid choice![/]")
 
 
+# ================= PREFLIGHT =================
+def doctor():
+    """Catch the environment traps before a long unattended batch.
+
+    The two that actually bit us: the default `python` on this machine is a
+    WorkBuddy 3.13 without playwright, and the temp-mail host needs an apex
+    domain (the *. subdomain is NXDOMAIN). Both are cheap to check up front.
+    """
+    import importlib.util
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    state = {"ok": 0, "warn": 0, "fail": 0}
+
+    def ok(msg):
+        state["ok"] += 1
+        console.print(f"  [green]OK[/]   {msg}")
+
+    def warn(msg):
+        state["warn"] += 1
+        console.print(f"  [yellow]WARN[/] {msg}")
+
+    def fail(msg):
+        state["fail"] += 1
+        console.print(f"  [red]FAIL[/] {msg}")
+
+    console.print()
+    console.print(Panel("ENVIRONMENT CHECK", style="bold cyan"))
+
+    ver = sys.version_info
+    if ver >= (3, 10):
+        ok(f"Python {ver.major}.{ver.minor}.{ver.micro}")
+    else:
+        fail(f"Python {ver.major}.{ver.minor}.{ver.micro} — need >= 3.10")
+
+    if importlib.util.find_spec("playwright"):
+        ok("playwright installed in this interpreter")
+    else:
+        fail("playwright missing — use ./venv/Scripts/python.exe (the default python is a different install)")
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            binary = Path(p.chromium.executable_path)
+        if binary.exists():
+            ok("Chromium binary present")
+        else:
+            fail("Chromium binary missing — python -m playwright install chromium")
+    except Exception as exc:
+        warn(f"could not verify the Chromium binary: {type(exc).__name__}")
+
+    ok(
+        f"headless={HEADLESS}, manual_fallback={MANUAL_FALLBACK} "
+        f"({MANUAL_TIMEOUT:.0f}s cap)"
+    )
+    if not HEADLESS and MANUAL_FALLBACK:
+        warn("visible browser: a failed slider will pause for up to "
+             f"{MANUAL_TIMEOUT:.0f}s per account")
+
+    try:
+        probe = TEMPIK_BASE.rstrip("/") + "/api/config"
+        with urllib.request.urlopen(probe, timeout=6) as resp:
+            ok(f"temp-mail API reachable (HTTP {resp.status})")
+    except urllib.error.HTTPError as exc:
+        # The host answered; this particular probe endpoint may need a
+        # session. That is a different problem from DNS/proxy being down.
+        warn(f"temp-mail host answered HTTP {exc.code} on /api/config")
+    except Exception as exc:
+        warn(f"temp-mail API not reachable from here: {type(exc).__name__} "
+             f"(proxy/DNS or worker down)")
+
+    if DATA_DIR.is_dir() and os.access(DATA_DIR, os.W_OK):
+        ok(f"data dir writable: {DATA_DIR}")
+    else:
+        fail(f"data dir not writable: {DATA_DIR}")
+
+    console.print()
+    console.print(
+        f"  [green]{state['ok']} ok[/]  [yellow]{state['warn']} warn[/]  "
+        f"[red]{state['fail']} fail[/]"
+    )
+    if state["fail"]:
+        console.print("  [red]Fix the failures before starting a batch.[/]")
+    console.print()
+    return 1 if state["fail"] else 0
+
+
 # ================= CLI =================
 def main():
     """CLI entry point."""
@@ -255,14 +354,17 @@ def main():
     for i, arg in enumerate(args):
         if arg == "-n" and i + 1 < len(args):
             n = int(args[i + 1])
+    headed = "--headed" in args
 
     if command == "signup":
-        asyncio.run(menu_signup_cli(n))
+        asyncio.run(menu_signup_cli(n, headless=False if headed else None))
+    elif command == "doctor":
+        sys.exit(doctor())
     elif command == "view":
         menu_view_results()
     else:
         console.print(f"[red]Unknown command:[/] {command}")
-        console.print(Text("Usage: python main.py [signup|view] [-n N]", style="dim"))
+        console.print(Text("Usage: python main.py [signup|view|doctor] [-n N] [--headed]", style="dim"))
 
 
 if __name__ == "__main__":

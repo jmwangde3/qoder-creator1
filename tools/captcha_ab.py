@@ -8,6 +8,10 @@ account can have more than one session: Qoder's OTP screen has no resend, so a
 late mail forces the flow to go back and pass the slider again. Counting
 sessions is the only fair way to compare two solvers -- otherwise whatever
 happens in the mail step shows up as a slider failure.
+
+Real signup calls solve_slider_local(max_attempts=5). The unit tests and the
+local mock use 2 or 3, and older logs still contain those lines from before
+test logging was redirected. Only /5 sessions are real traffic.
 """
 
 import re
@@ -15,6 +19,7 @@ import sys
 import pathlib
 
 LOG = pathlib.Path(__file__).resolve().parents[1] / "data" / "qoder.log"
+REAL_ATTEMPTS = 5
 
 
 def parse(start: int = 0):
@@ -37,6 +42,8 @@ def parse(start: int = 0):
             continue
         attempt = re.search(r"captcha attempt (\d+)/(\d+)", line)
         if attempt:
+            if int(attempt.group(2)) != REAL_ATTEMPTS:
+                continue
             number = int(attempt.group(1))
             if number == 1 or session is None or session["closed"]:
                 session = {

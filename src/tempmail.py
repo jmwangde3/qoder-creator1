@@ -77,6 +77,21 @@ _OTP_TEXT_HINTS = (
     "otp", "passcode", "one-time",
 )
 
+# `<style>` contents survive the tag stripper in _plain(), so inline CSS like
+# `color:#000000` leaves a bare 000000 in the text. That is a colour, not a
+# code: it can win the keyword match, and it can turn "the only 6-digit number
+# in the mail" into two numbers so the real code is rejected as ambiguous.
+# Hex colours containing a-f cannot match a digits-only regex, but keep them
+# listed so the intent is obvious if the extractor ever widens.
+_CSS_COLOR_CODES = frozenset(
+    {
+        "000000", "111111", "222222", "333333", "444444", "555555",
+        "666666", "777777", "888888", "999999", "232323", "464646",
+        "aaaaaa", "bbbbbb", "cccccc", "dddddd", "eeeeee", "ffffff",
+        "f9f8f9",
+    }
+)
+
 
 # ==================== HELPERS ====================
 def utc_stamp(offset: float = 0.0) -> str:
@@ -528,10 +543,17 @@ class TempikClient:
         """Dig out a code that directly follows a verification-code phrase.
 
         Bounded to 60 non-digit characters so the match cannot jump across
-        an unrelated number further down the mail.
+        an unrelated number further down the mail. CSS colour codes are
+        skipped: `verification code` followed by a `<style>` block can put
+        000000 right where the real code should be.
         """
-        match = re.search(_CODE_PREFIX + r"[^0-9]{0,60}(\d{4,8})", text, re.IGNORECASE)
-        return match.group(1) if match else None
+        for match in re.finditer(
+            _CODE_PREFIX + r"[^0-9]{0,60}(\d{4,8})", text, re.IGNORECASE
+        ):
+            code = match.group(1)
+            if code.lower() not in _CSS_COLOR_CODES:
+                return code
+        return None
 
     def extract_otp(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Extract the verification code, preferring mails that look like OTPs.
@@ -562,7 +584,7 @@ class TempikClient:
                 return code
 
         for _, text in priority:
-            found = set(re.findall(r"\b(\d{6})\b", text))
+            found = set(re.findall(r"\b(\d{6})\b", text)) - _CSS_COLOR_CODES
             if len(found) == 1:
                 code = found.pop()
                 write_log(f"OTP (single number): {code}", "SUCCESS")

@@ -1,9 +1,9 @@
 # Qoder Creator - Configuration Example
 # Copy this file to config.toml and fill in your values.
-# config.toml is gitignored — never commit real credentials.
+# config.toml is gitignored ï¿½ never commit real credentials.
 
 [api]
-# Tempik — disposable email API (Cloudflare Workers)
+# Tempik ï¿½ disposable email API (Cloudflare Workers)
 # Deploy: https://github.com/hirotomasato/tempik
 # Set ke URL Cloudflare Workers Anda, contoh:
 tempmail_base = "https://tempik.yourdomain.com/api"
@@ -35,6 +35,16 @@ mode = "none"
 # Proxy list file (only used when mode = "file")
 # Format: ip:port:user:pass (one per line)
 pool_file = "proxies.txt"
+
+[captcha]
+# Human fallback after every automatic slider attempt failed. Only used when
+# the browser is visible (main.py signup --headed, or headless = false).
+# Headless batches skip it: nobody is watching, so waiting is pure loss.
+manual_fallback = true
+
+# Hard cap in seconds. On timeout the account is abandoned as before and the
+# batch moves on; the process never hangs. Env: QODER_MANUAL_TIMEOUT.
+manual_timeout = 45
 
 [output]
 # Where to save results

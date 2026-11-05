@@ -4,8 +4,11 @@ Logging, random generators, save/load helpers.
 """
 
 import json
+import os
 import random
 import string
+import sys
+import tempfile
 import hashlib
 import uuid
 from datetime import datetime, timezone
@@ -25,9 +28,23 @@ def setup_logging():
 
 
 def write_log(message: str, level: str = "INFO"):
-    """Write a log entry."""
+    """Write a log entry.
+
+    ``QODER_LOG_FILE`` redirects the stream. Under unittest the stream is
+    redirected as well: `discover -s tests` does not import tests/__init__.py,
+    so an env var set there would be silently ignored, and fake "Signup start"
+    / "captcha attempt" lines would land in the very file that
+    tools/captcha_ab.py parses. One test run injected two phantom slider
+    sessions into an A/B measurement that way.
+    """
+    override = os.environ.get("QODER_LOG_FILE")
+    if not override and "unittest" in sys.modules:
+        override = str(
+            Path(tempfile.gettempdir()) / "qoder-creator-unittests.log"
+        )
+    path = Path(override or LOG_FILE)
     timestamp = datetime.now(timezone.utc).isoformat()
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
+    with open(path, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] [{level}] {message}\n")
 
 

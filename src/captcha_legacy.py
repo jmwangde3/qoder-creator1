@@ -121,8 +121,15 @@ async def solve_slider_local(
     console: Console = None,
     log: Optional[Callable[[str], None]] = None,
     flow_advanced=None,
+    manual_fallback: bool = False,
+    manual_timeout: float = 45.0,
 ) -> bool:
-    """Solve slider Aliyun captcha locally via image processing + mouse drag."""
+    """Solve slider Aliyun captcha locally via image processing + mouse drag.
+
+    ``manual_fallback`` / ``manual_timeout`` are accepted and ignored so the
+    A/B switch (QODER_CAPTCHA_IMPL=legacy) can drive both implementations
+    through the same signup call signature.
+    """
     c = console or Console()
 
     def emit(message: str) -> None:
