@@ -172,6 +172,68 @@ p≈0.26，统计上还不显著，方向一致。
    **不代表真实控件**：真实是 left 驱动 + 1.8x 短步 + 丢步行为。mock 5/5
    只证明"没退步"，不证明"真实能过"——必须配合真实 signup 的 verdict 统计。
 
+### 0.7 外部项目 `jmwangde3/qoder-autopilot` 调研（2026-11-05）
+
+本地克隆 `H:\temp\user\qoder-autopilot`，HEAD `299109f`，PyPI `qoder-autopilot 0.6.3`
+（README 里的 clone 地址仍写 `Daivageralda/qoder-autopilot`）。同一条 Qoder 注册
+链路，但**滑块比我们弱一档**：`captcha/slider.py` 一次性拖到底 + 过冲回拉，没有
+读数、没有闭环、没有判定码；`solver.py` 只判断控件是否消失；`tests/` 里 captcha
+零测试；最新提交把默认改成人工滑块（README 也写 manual "most reliable"）。
+所以它的价值在工程化和 OAuth/9Router 集成，不在识别/拖动算法。
+
+**离线实测**：拿我们 7 组人工真值 fixture（3 darken + 3 white + 1 no_hole），
+用 `G:/Python313/python.exe`（cv2 4.14）复现他们的 4 方法：
+
+| 复现方式 | 命中 ±25px | 说明 |
+|---|---|---|
+| 原样 4 方法投票 | **0/7** | 真实 puzzle 有两种格式，`480×240` 全画布 sprite / `52×200` 小图。他们没做 alpha bbox 裁剪，模板与背景同宽 → matchTemplate 只剩 1 列，亮度/边缘的搜索循环空转，全部返回图中央 240 |
+| 先按我们的方式裁 alpha bbox | **2/7** | 3 个白化缺口的 NCC 全偏 −55~−57px，分数却高达 0.982~0.995；投票把正确答案带偏（photo_c 真值 131、NCC 131 → 投票 72） |
+| 单用 masked NCC | 4/7 | 3 个 darken 全对，3 个 white 全错 |
+
+两条硬结论：
+
+1. **多方法投票别抄**。`ccoef` 与 `sqdif` 同源、永远同时对错，「一致票数」恒为 2，
+   是伪多样性；「列亮度下降」「边缘密度最大」噪声太大，会盖过正确的 NCC。
+   我们已证明绝对 score 不能作判据（§0.2），这次连「通道一致性」也不成立。
+2. 再次印证白化缺口是**半透明白蒙版**而非暗影：NCC 0.995 却偏 55px。
+   他们的 `ai_vision.py` prompt 写死 "dark shadow / darker area"，照抄必翻车。
+
+**值得吸收的（按优先级）**
+
+1. **末端过冲 + 回拉**（`slider.py:80-85`）：先多走 3~10px 再回 target。我们的
+   闭环是纯单调逼近、从不过冲；§0.3 说下一个瓶颈是轨迹，F001 又在 target>240
+   富集。这是唯一能直接 A/B 的形态改动。注意按短步 1.8x 换算、在 `mouse.up()`
+   前完成，用 verdict 统计判定，**别拿落点当指标**。
+2. **多选择器回退 + `offsetParent !== null` 可见性判断**（`solver.py:28-50`、
+   `slider.py:27-40`）：我们全是硬编码 `#aliyunCaptcha-*`，站点换版会全挂。
+   低成本、纯健壮性。
+3. **人工兜底模式**（`manual.py`）：连续 N 次自动失败时开可见窗口让人拖一次，
+   轮询控件消失后自动继续。我们现在失败就弃号，F001 连续 2 次尤其适合。
+4. **AI Vision 只做兜底**（`ai_vision.py`）：本地双通道都不确定时才调 API。预处理
+   可抄（按拼图 y 裁 strip、CLAHE、Canny、原图三联拼接、alpha 轮廓红边），
+   但 prompt 必须改成「亮或暗的异常区域」。
+5. **Camoufox 反检测**（`browser/camoufox.py`）：C++ 级指纹，理论上能压 F001。
+   风险：Firefox 内核（我们的 mouse 事件 / 1.8x 增益 / left 读数都在 Chromium
+   上标定）、`pyproject.toml` classifiers 只列 macOS/POSIX、要额外下载浏览器。
+   只做小样本 A/B，别直接换。
+6. **工程化**：`doctor` 健康检查（正好治我们踩过的「默认 python 3.13 没有
+   playwright」环境坑）、Pydantic Settings、`--dry-run` / `--format json|csv` /
+   `--log-file`、并行 staggered 2s + `asyncio.gather(return_exceptions=True)`、
+   异常层级、截图自动清理。我们 `main.py` 目前只有 `signup` / `view`。
+7. **OTP 的 CSS 颜色黑名单**（`auth/otp.py`）：`000000`/`ffffff` 等 18 个 6 位
+   十六进制会被误当验证码；letter-spacing / 大字号两级优先也可抄。
+
+**给姊妹会话（OAuth 写回）的对照**：`auth/oauth.py` 有完整 PKCE device flow
+（challenge=S256、nonce、machine_id、verifier → `deviceToken` 轮询，202/404
+pending → 200 token，`User-Agent: Go-http-client/2.0`）；`infra/ninerouter.py` 有
+`providerConnections` 表结构与 data JSON 字段（expires_in 封顶 30 天、WAL +
+busy_timeout）；`infra/relay.py` 是带 Bearer token + 30req/60s 限流的 FastAPI
+远程写库服务 —— 如果桌面端 Job 沙箱写不到本机 DB，这是现成方案。
+
+**别抄**：`solver.py:136-143` 的 retry offset（首试 ±2px、2~3 次 ±5px、之后
+±15px 随机）。F001 与落点无关，给同一个 target 加噪声只会把好落点弄坏；重试
+应该换图重发，我们已经有这条链路。一次性拖动同理。
+
 ---
 
 ## 1. 快速开始
