@@ -150,6 +150,8 @@ class SignupManager:
                 browser = await launch_stealth_browser(p, proxy, self.headless)
                 context = await create_stealth_context(browser, proxy)
                 page = await context.new_page()
+                if _os.environ.get("QODER_NET_PROBE"):
+                    self._install_net_probe(page, idx)
 
                 # Step 3: Open signup page
                 c.print("  :globe_with_meridians: Opening signup page...")
@@ -614,6 +616,35 @@ class SignupManager:
             )
         except Exception:
             return []
+
+    @staticmethod
+    def _install_net_probe(page: Page, idx: int) -> None:
+        """Log Qoder's XHR/fetch traffic when QODER_NET_PROBE is set.
+
+        A verification mail that never arrives leaves two suspects: Qoder
+        refused to send it, or it sent and something downstream dropped it.
+        The signup page's own response is the only evidence that separates
+        them. Bodies are truncated; this is for status codes and error text,
+        not for collecting session material.
+        """
+        async def _log(response):
+            try:
+                body = (await response.text())[:400].replace("\n", " ")
+            except Exception:
+                body = "<no body>"
+            write_log(
+                f"[{idx}] NET {response.request.method} {response.status} "
+                f"{response.url} post={(response.request.post_data or '')[:300]!r} "
+                f"body={body!r}",
+                "INFO",
+            )
+
+        def probe(response):
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            asyncio.ensure_future(_log(response))
+
+        page.on("response", probe)
 
     @staticmethod
     async def _snapshot(page: Page, tag: str) -> None:

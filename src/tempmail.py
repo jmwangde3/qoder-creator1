@@ -49,6 +49,22 @@ _RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
 # better detected quickly and retried than waited out.
 _REQUEST_TIMEOUT = 12.0
 
+# Inbox reads are the one call that must sit out a TCP retransmission blackout.
+# Measured on this uplink (reused socket, 2026-11-05): healthy reads answer in
+# 0.4–2.2s, but the same socket intermittently stalls for 12–30s. At 12s the
+# timeout fires just before TCP's ~15s retransmit, so a recoverable stall is
+# thrown away and the next attempt pays for a fresh TLS handshake. 28s rides
+# through it; three attempts keep the worst case near the old budget. Writes
+# keep the short timeout: a dead line should fail fast there.
+_POLL_TIMEOUT = 28.0
+_POLL_RETRIES = 3
+
+# The worker/Cloudflare closes idle keep-alive sockets without telling us.
+# Reusing one after the 60s OTP wait cost two 28s timeouts per round before a
+# fresh TLS handshake finally succeeded. A healthy reconnect is ~1.5s, so drop
+# the socket proactively once it has been idle longer than this.
+_IDLE_RECONNECT = 30.0
+
 # When every read in a wait window failed on the network, the inbox is not
 # empty — it is unreadable. Reporting "no mail" in that state makes the caller
 # re-send the code, which invalidates one that may already have been delivered.
@@ -157,6 +173,7 @@ class _KeepAlive:
         self.tls = tls
         self._conn: Optional[http.client.HTTPConnection] = None
         self._ip: Optional[str] = None
+        self._last_used: Optional[float] = None
         self._ctx = ssl.create_default_context()
 
     def _resolve(self) -> str:
@@ -227,6 +244,7 @@ class _KeepAlive:
             except Exception:
                 pass
         self._conn = None
+        self._last_used = None
 
     def _connect(self) -> None:
         self.close()
@@ -257,14 +275,36 @@ class _KeepAlive:
         self._conn = conn
 
     def request(self, method: str, path: str, body: Optional[bytes],
-                headers: Dict[str, str]) -> tuple:
+                headers: Dict[str, str],
+                timeout: Optional[float] = None) -> tuple:
+        now = time.monotonic()
+        if (
+            self._conn is not None
+            and self._conn.sock is not None
+            and self._last_used is not None
+            and now - self._last_used > _IDLE_RECONNECT
+        ):
+            self.close()
         if self._conn is None or self._conn.sock is None:
             self._connect()
 
         assert self._conn is not None
-        self._conn.request(method, path, body=body, headers=headers)
-        resp = self._conn.getresponse()
-        data = resp.read()
+        # The socket is shared by every call, so the per-request override must
+        # be reset each time — a previous long poll must not leak into the next
+        # short write.
+        self._conn.sock.settimeout(
+            self.timeout if timeout is None else timeout
+        )
+        try:
+            self._conn.request(method, path, body=body, headers=headers)
+            resp = self._conn.getresponse()
+            data = resp.read()
+        except Exception:
+            # A timed-out socket cannot be reused; rebuilding it on the next
+            # attempt is cheaper than re-waiting the full timeout.
+            self.close()
+            raise
+        self._last_used = time.monotonic()
         if resp.will_close:
             self.close()
         return resp.status, data
@@ -299,6 +339,7 @@ class TempikClient:
         body: Optional[Dict[str, Any]] = None,
         with_session: bool = True,
         retries: int = _HTTP_RETRIES,
+        timeout: Optional[float] = None,
     ) -> Any:
         """Call the tempik API over a reused connection.
 
@@ -306,6 +347,10 @@ class TempikClient:
         request itself is wrong, so retrying cannot change the outcome.
         Transport failures drop the socket and retry with jittered backoff —
         on a lossy uplink the retry is usually a different packet draw.
+
+        `timeout` overrides the socket timeout for this call only; inbox polls
+        pass a longer one because a stalled read there is cheaper to wait out
+        than to rebuild the TLS connection.
         """
         target = f"{self._prefix}{path}" or "/"
         payload = None if body is None else json.dumps(body).encode()
@@ -324,7 +369,9 @@ class TempikClient:
 
         for attempt in range(1, retries + 1):
             try:
-                status, raw = self._http.request(method, target, payload, headers)
+                status, raw = self._http.request(
+                    method, target, payload, headers, timeout=timeout
+                )
                 if 400 <= status < 500 and status != 429:
                     raise urllib.error.HTTPError(
                         f"{self.base_url}{path}",
@@ -434,7 +481,11 @@ class TempikClient:
         if not addr:
             raise ValueError("No email address provided")
 
-        data = self._request(f"/inboxes/{addr}/messages")
+        data = self._request(
+            f"/inboxes/{addr}/messages",
+            retries=_POLL_RETRIES,
+            timeout=_POLL_TIMEOUT,
+        )
         return data if isinstance(data, list) else []
 
     @staticmethod

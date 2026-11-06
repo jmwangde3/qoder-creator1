@@ -8,6 +8,7 @@ import asyncio
 import io
 import socket
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -116,6 +117,119 @@ class DnsCacheTest(unittest.TestCase):
         self.assertEqual(
             tempmail_mod._KeepAlive("example.test")._resolve(), "104.21.82.183"
         )
+
+
+class RequestBudgetTest(unittest.TestCase):
+    """Inbox polls get a longer, separate timeout from writes.
+
+    A 12s door on a shared socket threw away readable stalls; the fix is a
+    per-call override so a long poll cannot slow down create_inbox.
+    """
+
+    def test_get_messages_uses_the_long_poll_budget(self):
+        c = tempmail_mod.TempikClient("https://example.invalid/api")
+        calls = {}
+
+        def fake(path, **kw):
+            calls.update(path=path, **kw)
+            return []
+
+        c._request = fake
+        self.assertEqual(c.get_messages("x@example.test"), [])
+        self.assertEqual(calls["retries"], tempmail_mod._POLL_RETRIES)
+        self.assertEqual(calls["timeout"], tempmail_mod._POLL_TIMEOUT)
+
+    def test_timeout_override_is_applied_and_then_reset(self):
+        class FakeSocket:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        class FakeConn:
+            sock = FakeSocket()
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                class R:
+                    status = 200
+                    will_close = False
+
+                    def read(self):
+                        return b"[]"
+
+                return R()
+
+        ka = tempmail_mod._KeepAlive("example.test", timeout=12.0)
+        ka._conn = FakeConn()
+
+        ka.request("GET", "/x", None, {}, timeout=28.0)
+        ka.request("GET", "/x", None, {})
+        self.assertEqual(ka._conn.sock.timeouts, [28.0, 12.0])
+
+    def test_idle_connection_is_rebuilt_before_reuse(self):
+        class FakeSocket:
+            def settimeout(self, value):
+                pass
+
+        class FakeConn:
+            def __init__(self):
+                self.sock = FakeSocket()
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                class R:
+                    status = 200
+                    will_close = False
+
+                    def read(self):
+                        return b"[]"
+
+                return R()
+
+        ka = tempmail_mod._KeepAlive("example.test", timeout=12.0)
+        ka._conn = FakeConn()
+        ka._last_used = time.monotonic() - tempmail_mod._IDLE_RECONNECT - 1
+
+        rebuilt = []
+
+        def fake_connect():
+            rebuilt.append(1)
+            ka._conn = FakeConn()
+
+        ka._connect = fake_connect
+        ka.request("GET", "/x", None, {})
+        self.assertEqual(len(rebuilt), 1)
+        self.assertIsNotNone(ka._last_used)
+
+    def test_transport_error_drops_the_socket(self):
+        class FakeSocket:
+            def settimeout(self, value):
+                pass
+
+        class FakeConn:
+            def __init__(self):
+                self.sock = FakeSocket()
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                raise TimeoutError("read timed out")
+
+        ka = tempmail_mod._KeepAlive("example.test", timeout=12.0)
+        ka._conn = FakeConn()
+        ka._last_used = time.monotonic()
+
+        with self.assertRaises(TimeoutError):
+            ka.request("GET", "/x", None, {})
+        self.assertIsNone(ka._conn)
+        self.assertIsNone(ka._last_used)
 
 
 if __name__ == "__main__":
