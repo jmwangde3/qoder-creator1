@@ -15,6 +15,10 @@ config.toml
 proxies.txt
 .env
 
+# Local handoff notes — never commit or push
+HANDOFF*.md
+handoff*.md
+
 # Output — accounts, logs, tokens
 data/
 *.jsonl
