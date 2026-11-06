@@ -111,6 +111,48 @@ def generate_machine_id() -> str:
     return hashlib.md5(str(random.randint(1000000, 9999999)).encode()).hexdigest()[:32]
 
 
+# ================= NAMES =================
+# Every account used to be registered as "User Dev", which makes a batch
+# trivially recognizable. A 40x40 pool gives 1600 combinations; the per-process
+# set avoids exact repeats within one run.
+_FIRST_NAMES = (
+    "Agus", "Andi", "Arif", "Bayu", "Budi", "Candra", "Dedi", "Dimas",
+    "Eko", "Fajar", "Galih", "Hadi", "Hendra", "Iwan", "Joko", "Lukman",
+    "Nanda", "Rizki", "Samsul", "Slamet", "Sugeng", "Taufik", "Wahyu",
+    "Yudi", "Zainal", "Adi", "Farhan", "Gilang", "Indra", "Jaka", "Luthfi",
+    "Rahmat", "Rudi", "Surya", "Teguh", "Umar", "Wira", "Yusuf", "Dewi",
+    "Siti", "Ayu", "Indah", "Fitri", "Nurul", "Putri", "Anisa", "Dinda",
+    "Maya", "Wulan", "Yuni", "Ratna", "Endah", "Ika", "Nia", "Rani",
+    "Lestari", "Permata",
+)
+_LAST_NAMES = (
+    "Santoso", "Wijaya", "Pratama", "Hidayat", "Nugroho", "Saputra",
+    "Setiawan", "Kurniawan", "Firmansyah", "Ramadhan", "Siregar",
+    "Simanjuntak", "Hutapea", "Nasution", "Lubis", "Gunawan", "Halim",
+    "Rahman", "Ismail", "Suryana", "Permana", "Kusuma", "Wibowo", "Hartono",
+    "Susanto", "Budiman", "Sudirman", "Rahayu", "Utami", "Handoko", "Irawan",
+    "Prasetyo", "Yulianto", "Arifin", "Fadillah", "Harahap", "Sinaga",
+    "Purnama", "Sihombing", "Pangestu",
+)
+_USED_NAMES: set = set()
+
+
+def generate_name() -> tuple:
+    """Return a varied first/last name pair for the signup form."""
+    first = last = ""
+    for _ in range(30):
+        first = random.choice(_FIRST_NAMES)
+        last = random.choice(_LAST_NAMES)
+        if first == last:
+            continue
+        full = f"{first} {last}"
+        if full not in _USED_NAMES:
+            _USED_NAMES.add(full)
+            return first, last
+    # Pool exhausted or unlucky; a repeat is better than blocking a signup.
+    return first, last
+
+
 def generate_ms_deviceid() -> str:
     """Generate a fake Microsoft device ID."""
     return str(uuid.uuid4())

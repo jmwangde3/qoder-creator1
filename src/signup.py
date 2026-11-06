@@ -15,7 +15,7 @@ from rich.text import Text
 from .config import (
     QODER_BASE, ACCOUNTS_FILE, MANUAL_FALLBACK, MANUAL_TIMEOUT,
 )
-from .utils import write_log, generate_password, save_jsonl
+from .utils import write_log, generate_password, generate_name, save_jsonl
 from .tempmail import TempikClient, sent_at_stamp
 from .proxy import ProxyPool
 from .stealth import create_stealth_context, launch_stealth_browser
@@ -165,9 +165,11 @@ class SignupManager:
                 # Step 4: Fill form (name + email)
                 c.print("  :pencil: Filling signup form...")
                 try:
-                    await page.fill("#basic_firstName", "User")
-                    await page.fill("#basic_lastName", "Dev")
+                    first_name, last_name = generate_name()
+                    await page.fill("#basic_firstName", first_name)
+                    await page.fill("#basic_lastName", last_name)
                     await page.fill("#basic_email", email)
+                    write_log(f"[{idx}] Signup name: {first_name} {last_name}", "INFO")
                 except Exception as e:
                     write_log(f"[{idx}] Form fill error: {e}", "ERROR")
                     c.print(f"  :x: [red]Form fill failed: {e}[/]")
